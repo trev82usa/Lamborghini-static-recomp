@@ -27,6 +27,13 @@ add_compile_definitions(
 # readily than GCC. Set before add_subdirectory so the runtime gets them too.
 add_compile_options(-fno-strict-aliasing -fwrapv)
 
+# Portable Linux binary: runs on glibc 2.34+ rather than only the build
+# machine's (src/glibc_compat.h). Before add_subdirectory: the runtime too.
+option(LAMBO_PORTABLE_GLIBC "Bind newer glibc symbol versions to old ones" ON)
+if(LAMBO_PORTABLE_GLIBC AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_compile_options(-include "${CMAKE_CURRENT_SOURCE_DIR}/src/glibc_compat.h")
+endif()
+
 # ── xboxrecomp toolkit ──────────────────────────────────────────
 #
 # Option A: xboxrecomp as a subdirectory (simplest)
@@ -110,6 +117,9 @@ else()
     # only -- the Windows build has no SDL2 -- so main.c calls it under
     # LAMBO_AUDIO_SHIM.
     target_sources(${PROJECT_NAME} PRIVATE src/audio_shim.c)
+    if(LAMBO_PORTABLE_GLIBC)
+        target_sources(${PROJECT_NAME} PRIVATE src/glibc_compat.c)
+    endif()
     target_compile_definitions(${PROJECT_NAME} PRIVATE LAMBO_AUDIO_SHIM=1)
     target_link_options(${PROJECT_NAME} PRIVATE -rdynamic)
     # No .exe suffix here, and "Lamborghini" is the data folder beside it.

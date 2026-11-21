@@ -25,6 +25,11 @@ have changed since. For playing and building, see the [README](../README.md).
   race scene, so it was treated as race HUD and its arc of items torn apart. A frame with
   full-width divider lines (menus only) now keeps the HUD centred.
 - Rain drops render as refracting droplets (texture-shader dot-product modes).
+- Portable binary: `src/glibc_compat.*` binds fmod/sqrtf/log10f/strtol/strtoul to their old
+  glibc symbol versions, so the release runs on glibc 2.34+ instead of only on 2.43
+  (`-DLAMBO_PORTABLE_GLIBC=OFF` disables it).
+- Missing game files now show a message box explaining where `Lamborghini/default.xbe` goes
+  (it used to print a toolkit message about a 'game' folder to the terminal only).
 
 ## Playing (Linux, native build)
 Put `Lamborghini.x86_64` next to the extracted `Lamborghini/` data folder and run it. It opens

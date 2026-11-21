@@ -898,9 +898,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     /* Step 1: Load XBE */
     if (!load_xbe(YOUR_GAME_XBE_PATH, &xbe_data, &xbe_size)) {
-        MessageBoxA(NULL, "Failed to load default.xbe.\n"
-                    "Place the game files in the 'game' subdirectory.",
-                    "Recomp", MB_ICONERROR);
+        static const char msg[] =
+            "Game files not found: Lamborghini/default.xbe is missing.\n\n"
+            "Copy your own Lamborghini game files (default.xbe, the .xfs files,\n"
+            "Audio/ and Foreign/) into the folder named 'Lamborghini' next to\n"
+            "this program. See README.txt.";
+#if defined(_WIN32)
+        MessageBoxA(NULL, msg, "Lamborghini", MB_ICONERROR);
+#else
+        {   /* A double-clicked program has no terminal: show a box too. */
+            extern int SDL_ShowSimpleMessageBox(uint32_t flags, const char *title,
+                                                const char *message, void *window);
+            fprintf(stderr, "%s\n", msg);
+            SDL_ShowSimpleMessageBox(0x10 /* SDL_MESSAGEBOX_ERROR */, "Lamborghini", msg, NULL);
+        }
+#endif
         return 1;
     }
     printf("XBE loaded: %zu bytes\n", xbe_size);
