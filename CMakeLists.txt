@@ -106,6 +106,17 @@ if(WIN32)
         # function's symbol, i.e. to the guest function that faulted.
         dbghelp
     )
+    if(XBOXRECOMP_SDL_HOST)
+        # SDL2 host layer as on Linux (see xboxrecomp's XBOXRECOMP_SDL_HOST):
+        # also the audio shim, which only needs SDL2.
+        find_package(SDL2 REQUIRED)
+        target_link_libraries(${PROJECT_NAME} PRIVATE SDL2::SDL2)
+        target_sources(${PROJECT_NAME} PRIVATE src/audio_shim.c)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE LAMBO_AUDIO_SHIM=1 XBOX_SDL_HOST=1)
+        # audio_shim.c includes <SDL2/SDL.h>: the package's include root.
+        target_include_directories(${PROJECT_NAME} PRIVATE "${SDL2_DIR}/../../../include")
+        set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME Lamborghini)
+    endif()
 else()
     # Native Linux: SDL2 + OpenGL come in through the runtime libraries.
     # -rdynamic exports the generated functions (sub_XXXXXXXX) so dladdr can

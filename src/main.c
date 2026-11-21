@@ -841,6 +841,13 @@ static DWORD WINAPI lambo_gpu_sampler(LPVOID unused)
 
 /* ── WinMain ───────────────────────────────────────────────── */
 
+/* Windows with the SDL2 host layer (XBOX_SDL_HOST): as on Linux, SDL's
+ * window owns the process main thread and the boot sequence below runs on a
+ * thread of its own, so it is renamed; the real WinMain is at the end. */
+#if defined(_WIN32) && defined(XBOX_SDL_HOST)
+#define WinMain lambo_WinMain
+#endif
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                    LPSTR lpCmdLine, int nCmdShow)
 {
@@ -1158,6 +1165,24 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)
 static int lambo_guest_main(void)
 {
     return WinMain(NULL, NULL, NULL, 0);
+}
+#elif defined(XBOX_SDL_HOST)
+static int lambo_guest_main(void)
+{
+    return lambo_WinMain(GetModuleHandle(NULL), NULL, GetCommandLineA(), SW_SHOW);
+}
+
+#undef WinMain
+/* The process entry (GUI subsystem): the window, then the game on a thread.
+ * Same defaults as the Linux main() below. */
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
+                   LPSTR lpCmdLine, int nCmdShow)
+{
+    extern int xbox_HostWindowMain(int (*guest_main)(void));
+    (void)hInstance; (void)hPrevInstance; (void)lpCmdLine; (void)nCmdShow;
+    if (!getenv("RECOMP_FB_WINDOW")) _putenv("RECOMP_FB_WINDOW=1");
+    if (!getenv("RECOMP_GL")) _putenv("RECOMP_GL=1");
+    return xbox_HostWindowMain(lambo_guest_main);
 }
 #endif
 

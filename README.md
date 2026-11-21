@@ -1,9 +1,9 @@
-# Lamborghini — Xbox static recompilation for Linux
+# Lamborghini — Xbox static recompilation for Linux and Windows
 
-A native Linux port of **Lamborghini**, Rage Software's unreleased original-Xbox racing game
+A native PC port (Linux, and Windows as an experimental build) of **Lamborghini**, Rage Software's unreleased original-Xbox racing game
 (title ID 52410001, December 2002 pre-release build). It's built by *static recompilation*: the
 game's x86 code is translated to C ahead of time with
-[xboxrecomp](https://github.com/sp00nznet/xboxrecomp) and compiled into a normal Linux program,
+[xboxrecomp](https://github.com/sp00nznet/xboxrecomp) and compiled into a normal Linux or Windows program,
 running on an emulated Xbox kernel, GPU (NV2A → OpenGL) and audio (MCPX APU → SDL2).
 
 > **No game files are included.** You need **your own copy** of the game: the disc image
@@ -45,8 +45,12 @@ running on an emulated Xbox kernel, GPU (NV2A → OpenGL) and audio (MCPX APU �
   widescreen with an optional edge-anchored race HUD.
 - Sound: music, engines, effects and 3D positional audio.
 - Controllers (hot-plug, up to four) and keyboard.
+- **Linux** (main platform) and **Windows** (new, experimental: tested under Wine with a real GPU
+  at 60 fps with full sound, not yet on real Windows. Reports are very welcome!).
 
 ## Quick start
+
+### Linux
 
 1. Download `Lamborghini-recomp-<version>-linux-x86_64.zip` from
    [**Releases**](../../releases/latest) and extract it.
@@ -60,6 +64,21 @@ running on an emulated Xbox kernel, GPU (NV2A → OpenGL) and audio (MCPX APU �
    ```
 3. Run `Lamborghini.x86_64` (double-click it, or `./Lamborghini.x86_64` in a terminal). If it
    won't start, make it executable first: `chmod +x Lamborghini.x86_64`.
+
+### Windows (experimental)
+
+1. Download `Lamborghini-recomp-<version>-windows-x64.zip` from
+   [**Releases**](../../releases/latest) and **extract it** (don't run it from inside the zip).
+2. Extract your whole game ISO into the `Lamborghini` folder inside it
+   ([how](#getting-the-game-files)):
+   ```
+   Lamborghini-recomp\
+       Lamborghini.exe           <- run this
+       SDL2.dll, libepoxy-0.dll  <- keep these next to the exe
+       Lamborghini\              <- extract your ISO in here
+   ```
+3. Double-click `Lamborghini.exe`. SmartScreen may say *"Windows protected your PC"* because
+   the exe isn't signed: click **More info → Run anyway**.
 
 ## Getting the game files
 
@@ -92,6 +111,8 @@ Already have the disc's files extracted? Copy them all into the `Lamborghini` fo
 
 ## Requirements
 
+### Linux
+
 - **64-bit Linux with glibc 2.34 or newer**: Ubuntu 22.04+, Debian 12+, Fedora 35+, Linux Mint
   21+, Pop!_OS 22.04+, current Arch/Manjaro/EndeavourOS, Steam Deck desktop mode.
 - **A GPU with OpenGL 4.3**: any AMD or Intel GPU from the last decade with Mesa, or NVIDIA
@@ -101,6 +122,13 @@ Already have the disc's files extracted? Copy them all into the `Lamborghini` fo
   - Ubuntu/Debian/Mint: `sudo apt install libsdl2-2.0-0 libepoxy0`
   - Fedora: `sudo dnf install SDL2 libepoxy`
   - Arch/Manjaro: `sudo pacman -S sdl2 libepoxy`
+
+### Windows
+
+- **Windows 10 or 11, 64-bit.**
+- **A GPU with OpenGL 4.3 and your GPU maker's driver** (AMD, NVIDIA or Intel; any card from the
+  last ~10 years). The generic "Microsoft Basic Display Adapter" driver isn't enough.
+- Nothing else to install: `SDL2.dll` and `libepoxy-0.dll` come in the zip.
 
 ## Controls
 
@@ -192,15 +220,16 @@ override the saved settings for that run.
 
 ## Saves, settings and logs
 
-| What | Where |
-|---|---|
-| Save game (profiles, unlocks, records) | `~/.local/share/xboxrecomp/` |
-| Settings (F1 menu) | `~/.config/xboxrecomp/settings.ini` |
-| Log of the last run | `lamborghini_log.txt`, next to `Lamborghini.x86_64` |
-| Kernel log of the last run | `xbox_kernel.log`, next to `Lamborghini.x86_64` |
+| What | Linux | Windows |
+|---|---|---|
+| Save game (profiles, unlocks, records) | `~/.local/share/xboxrecomp/` | `%LOCALAPPDATA%\xboxrecomp\` |
+| Settings (F1 menu) | `~/.config/xboxrecomp/settings.ini` | `%LOCALAPPDATA%\xboxrecomp\settings.ini` |
+| Log of the last run | `lamborghini_log.txt` next to the program | same |
+| Kernel log of the last run | `xbox_kernel.log` next to the program | same |
 
-The saves are kept in your home folder, so you can move or update the game folder without
-losing them. To start fresh, delete `~/.local/share/xboxrecomp/`.
+The saves are kept outside the game folder, so you can move or update the game without losing
+them. To start fresh, delete that save folder. (Windows: paste `%LOCALAPPDATA%\xboxrecomp`
+into the Explorer address bar.)
 
 ## Having problems? Post your log
 
@@ -214,10 +243,10 @@ Please include:
 2. **What happened** and what you were doing (menu, track, car, time of day, weather,
    split-screen?).
 3. **A screenshot or short video** for anything visual, and a clip for sound problems.
-4. **Your system:** distro and version, GPU and driver (`glxinfo -B | head -20`), and your F1
-   settings.
-5. If it **crashed or won't start**, run it from a terminal (`./Lamborghini.x86_64`) and paste
-   what's printed there too.
+4. **Your system:** Linux distro or Windows version, GPU and driver version (Linux:
+   `glxinfo -B | head -20`), and your F1 settings.
+5. If it **crashed or won't start**: on Linux run it from a terminal (`./Lamborghini.x86_64`)
+   and paste what's printed; on Windows, a screenshot of any error message.
 
 **Common fixes first:**
 
@@ -230,6 +259,8 @@ Please include:
 | Starts but stops at a disc error / missing sounds or videos | Some files are missing: extract the *whole* ISO again |
 | Very slow (single-digit fps) | Your GPU or driver lacks OpenGL 4.3 and the game fell back to the CPU renderer; check the log for `[GL]` lines |
 | Controller not working | Check the log for `[INPUT] controller ... connected`; try another USB port or Bluetooth re-pair |
+| Windows: *"SDL2.dll / libepoxy-0.dll was not found"* | Keep both DLLs next to `Lamborghini.exe` (extract the whole zip) |
+| Windows: antivirus removes the exe | A false positive (unsigned, unusual program): restore it / add an exception |
 
 ## Known issues
 
@@ -238,7 +269,7 @@ Please include:
 - **Road:** some dotted/patchy road textures at certain times of day.
 - **Sound:** the tyre-skid sound can stutter.
 - **Frame hitches:** occasional long frames, mostly at race start with the whole field in view.
-- **Windows:** not released yet. Linux only for now.
+- **Windows:** new and experimental; tested under Wine with a real GPU, not yet on real Windows.
 
 ## Building from source
 
@@ -259,17 +290,25 @@ Then:
 ```sh
 git clone https://github.com/trev82usa/Lamborghini-static-recomp
 cd Lamborghini-static-recomp
-./scripts/build_linux.sh /path/to/Lamborghini/default.xbe
+./scripts/build_linux.sh /path/to/Lamborghini/default.xbe      # Linux
+./scripts/build_windows.sh /path/to/Lamborghini/default.xbe    # Windows exe, cross-compiled on Linux
 ```
 
-The script:
-1. clones xboxrecomp next to this repo (`../xboxrecomp`), checks out the tested commit
-   (`patches/xboxrecomp-base-commit.txt`) and applies `patches/xboxrecomp-lamborghini.patch`;
-2. recompiles your `default.xbe` into `src/recomp/gen/` (git-ignored; never commit or share it);
-3. applies the post-recompile fixes (`scripts/post_recomp_bink_fix.py`);
-4. builds `build-linux/Lamborghini.x86_64`.
+`build_windows.sh` runs **on Linux** (no Windows or Visual Studio needed). It downloads
+[llvm-mingw](https://github.com/mstorsjo/llvm-mingw), SDL2's MinGW package and libepoxy's MSYS2
+package into `../win-deps` (about 800 MB), and leaves `Lamborghini.exe` plus its two DLLs in
+`build-win/dist/`. It also needs `curl` and `tar` with zstd support.
 
-It takes about 8 minutes. After that, `ninja -C build-linux Lamborghini` rebuilds.
+Both scripts:
+1. clone xboxrecomp next to this repo (`../xboxrecomp`), check out the tested commit
+   (`patches/xboxrecomp-base-commit.txt`) and apply `patches/xboxrecomp-lamborghini.patch`;
+2. recompile your `default.xbe` into `src/recomp/gen/` (git-ignored; never commit or share it).
+   The generated code is the same for both platforms; `build_windows.sh` reuses it if present;
+3. apply the post-recompile fixes (`scripts/post_recomp_bink_fix.py`);
+4. build `build-linux/Lamborghini.x86_64` or `build-win/Lamborghini.exe`.
+
+Each takes about 6–8 minutes from scratch. After that, `ninja -C build-linux Lamborghini` or
+`ninja -C build-win Lamborghini.exe` rebuilds.
 
 | Path | What |
 |---|---|
@@ -280,7 +319,8 @@ It takes about 8 minutes. After that, `ninja -C build-linux Lamborghini` rebuild
 | `config/seed_functions.json` | Extra function entry points the disassembler misses |
 | `patches/xboxrecomp-lamborghini.patch` | All toolkit changes: OpenGL NV2A renderer, APU fixes, Linux kernel/host fixes |
 | `scripts/post_recomp_bink_fix.py` | Fixes applied to the generated code after each recompile |
-| `scripts/build_linux.sh` | One-step build |
+| `scripts/recompile.sh` | Toolkit checkout + patch, and recompiling `default.xbe` (used by both build scripts) |
+| `scripts/build_linux.sh` / `build_windows.sh` | One-step builds |
 | `docs/DEVLOG.md` | Development notes, build by build |
 
 ## Credits and license

@@ -4,6 +4,24 @@ Notes kept while building the port, newest first, including the many `RECOMP_*` 
 compatibility switches. Some early entries describe the Windows/Wine build and things that
 have changed since. For playing and building, see the [README](../README.md).
 
+## Windows build (v0.2.0, experimental)
+- `XBOXRECOMP_SDL_HOST` (CMake, Windows): the Windows build uses the Linux host layer: the SDL2
+  window with the F1 menu, scaling and widescreen (`fb_present_sdl.c`), SDL2 controllers and
+  keyboard, the SDL2 APU audio backend and the audio shim, and the OpenGL NV2A renderer, instead
+  of the GDI/D3D11 window, XInput, XAudio2 and the CPU rasteriser. Sources test `XBOX_SDL_HOST`.
+- `nv2a_gl.c`: the context is created per platform (surfaceless EGL on Linux; WGL on a hidden
+  window on Windows), and the rest is shared. libepoxy has to be its DLL on Windows: the static
+  library's WGL dispatch needs per-thread state that it sets up in DllMain, and crashed in
+  wglMakeCurrent.
+- The game's boot runs on its own thread with the SDL window on the main one, as on Linux:
+  `main.c` renames its WinMain to `lambo_WinMain` and the real WinMain calls
+  `xbox_HostWindowMain`.
+- No Media Foundation (missing on Windows "N" editions); imports are SDL2.dll, libepoxy-0.dll
+  and system DLLs only. Settings in `%LOCALAPPDATA%\xboxrecomp\settings.ini` beside the saves.
+- Tested under Wine 10 on an RX 6750 XT: 60 fps races, audio matching the Linux build (no
+  Doppler pitch spikes), settings load/save. Not yet run on real Windows.
+- `scripts/build_windows.sh` cross-compiles on Linux with llvm-mingw.
+
 ## Recent (November 2026)
 - **Race audio buzz fixed.** Two causes:
   - The APU left sub-frame holes when the title briefly switched the counter mode off. Voices

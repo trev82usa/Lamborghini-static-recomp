@@ -4,6 +4,9 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#ifdef _WIN32
+#include <windows.h>    /* the Windows SDL2 build: HRESULT, DWORD, ... */
+#endif
 
 #ifdef __cplusplus
 extern "C" {

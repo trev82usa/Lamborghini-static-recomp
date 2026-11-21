@@ -1,3 +1,47 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 427f5d8..a3781c4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -24,6 +24,21 @@ add_compile_definitions(
+ 
+ # Option to build examples
+ 
++# Windows with the POSIX hosts' SDL2 layer: the SDL2 window (F1 menu, scaling,
++# widescreen), SDL2 game controllers and audio device, and the OpenGL NV2A
++# renderer on a WGL context -- instead of the GDI/D3D11 window, XInput,
++# XAudio2 and the CPU rasteriser. Needs SDL2 (SDL2_DIR) and libepoxy
++# (EPOXY_DIR, the MinGW package's root). Sources test XBOX_SDL_HOST.
++option(XBOXRECOMP_SDL_HOST "Windows: SDL2 host layer + OpenGL renderer, as on Linux" OFF)
++if(WIN32 AND XBOXRECOMP_SDL_HOST)
++    add_compile_definitions(XBOX_SDL_HOST=1)
++    find_package(SDL2 REQUIRED)
++    set(EPOXY_DIR "" CACHE PATH "libepoxy MinGW root (include/, lib/libepoxy.a)")
++    if(NOT EXISTS "${EPOXY_DIR}/include/epoxy/gl.h")
++        message(FATAL_ERROR "XBOXRECOMP_SDL_HOST: set EPOXY_DIR to libepoxy's MinGW root")
++    endif()
++endif()
++
+ # ── Runtime Libraries ─────────────────────────────────────────
+ 
+ # Platform: Win32/NT type vocabulary + POSIX implementation of generic
+diff --git a/src/apu/CMakeLists.txt b/src/apu/CMakeLists.txt
+index 7e96f14..a65272f 100644
+--- a/src/apu/CMakeLists.txt
++++ b/src/apu/CMakeLists.txt
+@@ -41,7 +41,12 @@ if(WIN32)
+     # target, so the archive was built and never pulled in, and the first
+     # target to actually call into the APU failed at link with an undefined
+     # XAudio2Create rather than at build time here.
+-    target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm xaudio2_8 ole32)
++    if(XBOXRECOMP_SDL_HOST)
++        # apu_sdl2.c, the device backend the POSIX hosts use.
++        target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm SDL2::SDL2)
++    else()
++        target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm xaudio2_8 ole32)
++    endif()
+ else()
+     # POSIX (macOS, Linux): platform layer (Win32 primitives on POSIX),
+     # SDL2 for the audio device (apu_sdl2.c) and libm
 diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
 index 7746ae3..b3e0671 100644
 --- a/src/apu/apu_core.c
@@ -363,6 +407,19 @@ index 235140f..2c21bee 100644
  
  #if !defined(_WIN32) && defined(__aarch64__)
  /* POSIX arm64: the same hook over sigaction + ucontext, with the A64 decoder
+diff --git a/src/apu/apu_sdl2.c b/src/apu/apu_sdl2.c
+index 7eca83d..98551a6 100644
+--- a/src/apu/apu_sdl2.c
++++ b/src/apu/apu_sdl2.c
+@@ -21,7 +21,7 @@
+ #include <string.h>
+ #include "apu_xaudio2.h"
+ 
+-#if !defined(_WIN32)
++#if !defined(_WIN32) || defined(XBOX_SDL_HOST)
+ 
+ #include <SDL.h>
+ #include <time.h>
 diff --git a/src/apu/apu_state.h b/src/apu/apu_state.h
 index 7318675..bd20700 100644
 --- a/src/apu/apu_state.h
@@ -562,6 +619,49 @@ index 3ec56ca..8c64c6f 100644
  
      /* VP monitor mix */
      if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
+diff --git a/src/apu/apu_xaudio2.c b/src/apu/apu_xaudio2.c
+index e725646..ff8a13a 100644
+--- a/src/apu/apu_xaudio2.c
++++ b/src/apu/apu_xaudio2.c
+@@ -14,7 +14,7 @@
+ 
+ /* The XAudio2 backend is Windows-only. On POSIX hosts apu_sdl2.c provides
+  * the same xa2_* functions over SDL2. */
+-#if defined(_WIN32)
++#if defined(_WIN32) && !defined(XBOX_SDL_HOST)
+ 
+ #define COBJMACROS
+ #include <windows.h>
+diff --git a/src/apu/apu_xaudio2.h b/src/apu/apu_xaudio2.h
+index 583fc70..549876f 100644
+--- a/src/apu/apu_xaudio2.h
++++ b/src/apu/apu_xaudio2.h
+@@ -8,7 +8,7 @@
+ 
+ /* The device backend behind these functions: XAudio2 on Windows
+  * (apu_xaudio2.c), SDL2 on POSIX hosts (apu_sdl2.c). Same contract. */
+-#if defined(_WIN32)
++#if defined(_WIN32) && !defined(XBOX_SDL_HOST)
+ #define XA2_BACKEND_NAME "XAudio2"
+ #else
+ #define XA2_BACKEND_NAME "SDL2"
+diff --git a/src/input/CMakeLists.txt b/src/input/CMakeLists.txt
+index ae6228d..961586c 100644
+--- a/src/input/CMakeLists.txt
++++ b/src/input/CMakeLists.txt
+@@ -12,7 +12,11 @@ target_include_directories(xbox_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+ add_subdirectory(mapping)
+ target_link_libraries(xbox_input PUBLIC xbox_input_map)
+ 
+-if(WIN32)
++if(WIN32 AND XBOXRECOMP_SDL_HOST)
++    # SDL2 controllers and keyboard, as on POSIX.
++    target_sources(xbox_input PRIVATE keyboard_sdl.c)
++    target_link_libraries(xbox_input PUBLIC platform SDL2::SDL2)
++elseif(WIN32)
+     # Mouse+keyboard pad (RECOMP_MKB) reads Win32 raw input.
+     target_sources(xbox_input PRIVATE mkb_input.c)
+     # mingw-w64's libxinput.a imports XINPUT1_3.dll, the DirectX June 2010
 diff --git a/src/input/keyboard.c b/src/input/keyboard.c
 index 99ffa12..278dfc9 100644
 --- a/src/input/keyboard.c
@@ -620,7 +720,7 @@ index 99ffa12..278dfc9 100644
       * has to move whenever the state does or a press is never noticed. */
      out->dwPacketNumber = ++packet;
 diff --git a/src/input/xinput_device.c b/src/input/xinput_device.c
-index 5975014..6d14e56 100644
+index 5975014..9190984 100644
 --- a/src/input/xinput_device.c
 +++ b/src/input/xinput_device.c
 @@ -13,6 +13,7 @@
@@ -630,6 +730,15 @@ index 5975014..6d14e56 100644
 +#include <stdio.h>
  #include <stdlib.h>
  #include <string.h>
+ 
+@@ -49,7 +50,7 @@ static void keyboard_merge(XBOX_INPUT_STATE *pState)
+ }
+ 
+ /* ======================================================================== */
+-#if defined(_WIN32)
++#if defined(_WIN32) && !defined(XBOX_SDL_HOST)
+ /* ====================  XInput backend  ================================== */
+ /* ======================================================================== */
  
 @@ -71,6 +72,16 @@ void xbox_InputInit(void)
      }
@@ -742,7 +851,7 @@ index 5975014..6d14e56 100644
          g_controller_connected[dwPort] = FALSE;
          if (dwPort == 0 && xbox_InputKeyboardPoll(pState))
 diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
-index db45d05..5a17d28 100644
+index db45d05..2c3f9c7 100644
 --- a/src/kernel/CMakeLists.txt
 +++ b/src/kernel/CMakeLists.txt
 @@ -30,6 +30,7 @@ set(KERNEL_SOURCES
@@ -753,7 +862,21 @@ index db45d05..5a17d28 100644
  )
  
  add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
-@@ -51,6 +52,12 @@ else()
+@@ -47,10 +48,26 @@ if(WIN32)
+     # platform is an INTERFACE target on Windows: it contributes the src/
+     # include path that "platform/xbox_winnt.h" resolves against.
+     target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
++    if(XBOXRECOMP_SDL_HOST)
++        # nv2a_gl.c on a WGL context, through libepoxy's DLL (libepoxy-0.dll
++        # ships beside the exe): its WGL dispatch keeps per-thread state set
++        # up in DllMain, so the static library crashes in wglMakeCurrent.
++        target_include_directories(xbox_kernel PRIVATE "${EPOXY_DIR}/include")
++        target_link_libraries(xbox_kernel PUBLIC "${EPOXY_DIR}/lib/libepoxy.dll.a" opengl32 gdi32)
++        # pthreads (nv2a_gl.c, fb_present_sdl.c) from mingw's winpthreads,
++        # linked in statically so no libwinpthread-1.dll is needed.
++        target_link_libraries(xbox_kernel PUBLIC -l:libwinpthread.a)
++    endif()
+ else()
      # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
      find_package(OpenSSL REQUIRED)
      target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto)
@@ -1316,10 +1439,10 @@ index 327f01d..569d264 100644
  #endif /* NV2A_BACKEND_H */
 diff --git a/src/kernel/nv2a_gl.c b/src/kernel/nv2a_gl.c
 new file mode 100644
-index 0000000..3a34f4f
+index 0000000..0574223
 --- /dev/null
 +++ b/src/kernel/nv2a_gl.c
-@@ -0,0 +1,2860 @@
+@@ -0,0 +1,2945 @@
 +/*
 + * NV2A pixel work on the host GPU. See nv2a_gl.h for the model.
 + *
@@ -1332,7 +1455,7 @@ index 0000000..3a34f4f
 + */
 +#include "nv2a_gl.h"
 +
-+#if defined(_WIN32)
++#if defined(_WIN32) && !defined(XBOX_SDL_HOST)
 +
 +int  nv2a_gl_enabled(void) { return 0; }
 +void nv2a_gl_set_decoder(NvGlDecodeFn fn) { (void)fn; }
@@ -1366,8 +1489,16 @@ index 0000000..3a34f4f
 +
 +#else
 +
++#if defined(_WIN32)
++#include <windows.h>
++#include <epoxy/gl.h>
++#include <epoxy/wgl.h>
++#undef near                 /* windows.h's 16-bit leftovers */
++#undef far
++#else
 +#include <epoxy/egl.h>
 +#include <epoxy/gl.h>
++#endif
 +#include <pthread.h>
 +#include <stddef.h>
 +#include <stdio.h>
@@ -1474,8 +1605,14 @@ index 0000000..3a34f4f
 +int nv2a_gl_debug_view;
 +static pthread_t s_thread;
 +static NvGlDecodeFn s_decode;
++#if defined(_WIN32)
++static HWND s_hwnd;          /* hidden: only carries the pixel format */
++static HDC s_hdc;
++static HGLRC s_glrc;
++#else
 +static EGLDisplay s_dpy;
 +static EGLContext s_ctx;
++#endif
 +static GLuint s_prog, s_vao, s_vbo;
 +static uint32_t s_epoch = 1;  /* bumps at every sync: textures re-check */
 +
@@ -2096,7 +2233,70 @@ index 0000000..3a34f4f
 +
 +/* ── Context ─────────────────────────────────────────────────────────── */
 +
-+static int ctx_create(void)
++#if defined(_WIN32)
++/* Windows (XBOX_SDL_HOST): a WGL context on a hidden window owned by the
++ * executor thread. Everything is drawn into framebuffer objects and read
++ * back for the SDL window, as with the surfaceless EGL context on Linux, so
++ * the window's own framebuffer is never used and the window never shown. */
++static int ctx_platform_create(void)
++{
++    static const int cattr[] = {
++        WGL_CONTEXT_MAJOR_VERSION_ARB, 4, WGL_CONTEXT_MINOR_VERSION_ARB, 3,
++        WGL_CONTEXT_PROFILE_MASK_ARB, WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
++        0 };
++    PIXELFORMATDESCRIPTOR pfd;
++    WNDCLASSA wc;
++    HGLRC tmp;
++    int pf;
++
++    memset(&wc, 0, sizeof wc);
++    wc.style = CS_OWNDC;
++    wc.lpfnWndProc = DefWindowProcA;
++    wc.hInstance = GetModuleHandleA(NULL);
++    wc.lpszClassName = "xboxrecomp_nv2a_gl";
++    RegisterClassA(&wc);
++    s_hwnd = CreateWindowA(wc.lpszClassName, "nv2a_gl", WS_OVERLAPPEDWINDOW,
++                           0, 0, 64, 64, NULL, NULL, wc.hInstance, NULL);
++    s_hdc = s_hwnd ? GetDC(s_hwnd) : NULL;
++    if (!s_hdc) {
++        fprintf(stderr, "[GL] cannot create the WGL window (%lu)\n", GetLastError());
++        return 0;
++    }
++    memset(&pfd, 0, sizeof pfd);
++    pfd.nSize = sizeof pfd;
++    pfd.nVersion = 1;
++    pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
++    pfd.iPixelType = PFD_TYPE_RGBA;
++    pfd.cColorBits = 32;
++    pfd.cDepthBits = 24;
++    pfd.cStencilBits = 8;
++    pf = ChoosePixelFormat(s_hdc, &pfd);
++    if (!pf || !SetPixelFormat(s_hdc, pf, &pfd)) {
++        fprintf(stderr, "[GL] no OpenGL pixel format (%lu)\n", GetLastError());
++        return 0;
++    }
++    /* A legacy context first: wglCreateContextAttribsARB is an extension. */
++    tmp = wglCreateContext(s_hdc);
++    if (!tmp || !wglMakeCurrent(s_hdc, tmp)) {
++        fprintf(stderr, "[GL] wglCreateContext failed (%lu)\n", GetLastError());
++        return 0;
++    }
++    if (epoxy_has_wgl_extension(s_hdc, "WGL_ARB_create_context_profile"))
++        s_glrc = wglCreateContextAttribsARB(s_hdc, NULL, cattr);
++    wglMakeCurrent(NULL, NULL);
++    wglDeleteContext(tmp);
++    if (!s_glrc || !wglMakeCurrent(s_hdc, s_glrc)) {
++        fprintf(stderr, "[GL] cannot create an OpenGL 4.3 core context (%lu)\n",
++                GetLastError());
++        return 0;
++    }
++    fprintf(stderr, "[GL] WGL, %s / %s\n",
++            (const char *)glGetString(GL_RENDERER),
++            (const char *)glGetString(GL_VERSION));
++    return 1;
++}
++#else
++static int ctx_platform_create(void)
 +{
 +    static const EGLint cattr[] = {
 +        EGL_CONTEXT_MAJOR_VERSION, 4, EGL_CONTEXT_MINOR_VERSION, 3,
@@ -2130,6 +2330,14 @@ index 0000000..3a34f4f
 +    fprintf(stderr, "[GL] EGL %d.%d, %s / %s\n", major, minor,
 +            (const char *)glGetString(GL_RENDERER),
 +            (const char *)glGetString(GL_VERSION));
++    return 1;
++}
++#endif
++
++static int ctx_create(void)
++{
++    if (!ctx_platform_create())
++        return 0;
 +    if (!build_program())
 +        return 0;
 +
@@ -8077,19 +8285,77 @@ index efa5046..d3f7afc 100644
              int n = atoi(padspec);
              if (n >= 1 && n <= USB_GAMEPAD_MAX) s_npads = n;
          }
+diff --git a/src/video/CMakeLists.txt b/src/video/CMakeLists.txt
+index 331d2e2..2de7e99 100644
+--- a/src/video/CMakeLists.txt
++++ b/src/video/CMakeLists.txt
+@@ -11,11 +11,17 @@ target_include_directories(xbox_video PUBLIC
+ # xbox_input: the windows record keys in its key table (keyboard.c).
+ # xbox_nv2a: the window scans out the PVIDEO overlay (nv2a_mmio_hook.c).
+ target_link_libraries(xbox_video PUBLIC xbox_d3d8 xbox_input xbox_nv2a)
+-if(WIN32)
++if(WIN32 AND NOT XBOXRECOMP_SDL_HOST)
+     # gpu_present.c: the framebuffer window's D3D11 presenter.
+     target_sources(xbox_video PRIVATE gpu_present.c)
+     target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32
+                           d3d11 dxgi dxguid d3dcompiler)
++elseif(WIN32)
++    # SDL2 window as on POSIX. No Media Foundation player (video_player.c is
++    # stubbed, as on POSIX): MF is missing on Windows "N" editions, and the
++    # exe would not start there.
++    target_sources(xbox_video PRIVATE fb_present_sdl.c)
++    target_link_libraries(xbox_video PUBLIC SDL2::SDL2)
+ else()
+     # The framebuffer window on POSIX hosts: SDL2, on the process main thread
+     # (fb_present_sdl.c), which then also pumps the events the game
+diff --git a/src/video/fb_present.c b/src/video/fb_present.c
+index 3430107..210800e 100644
+--- a/src/video/fb_present.c
++++ b/src/video/fb_present.c
+@@ -24,7 +24,7 @@
+  */
+ #include <stdint.h>
+ 
+-#if defined(_WIN32)
++#if defined(_WIN32) && !defined(XBOX_SDL_HOST)
+ #include <windows.h>
+ #include <stdio.h>
+ #include <stdlib.h>
 diff --git a/src/video/fb_present_sdl.c b/src/video/fb_present_sdl.c
-index 87b7ef7..f1eea07 100644
+index 87b7ef7..6b49c0f 100644
 --- a/src/video/fb_present_sdl.c
 +++ b/src/video/fb_present_sdl.c
-@@ -42,6 +42,7 @@
+@@ -32,7 +32,7 @@
+  * Knobs: RECOMP_PRESENT_VSYNC=0 presents without waiting for the display;
+  * RECOMP_WINDOW_SCALE=<n> sizes the window (default 2).
+  */
+-#if !defined(_WIN32)
++#if !defined(_WIN32) || defined(XBOX_SDL_HOST)
+ 
+ #include <SDL.h>
+ #include <pthread.h>
+@@ -41,7 +41,20 @@
+ #include <stdio.h>
  #include <stdlib.h>
  #include <string.h>
++#if defined(_WIN32)
++#include <direct.h>                 /* _mkdir */
++#define mkdir(path, mode) _mkdir(path)
++static int fb_setenv(const char *name, const char *value, int overwrite)
++{
++    if (!overwrite && getenv(name))
++        return 0;
++    return _putenv_s(name, value);
++}
++#define setenv fb_setenv
++#else
  #include <sys/resource.h>
++#endif
 +#include <sys/stat.h>
  #include <time.h>
  
  #include "video_player.h"
-@@ -60,6 +61,7 @@ struct fb_slot {
+@@ -60,6 +73,7 @@ struct fb_slot {
      uint8_t *px;
      size_t   cap;
      uint32_t bpp;
@@ -8097,7 +8363,7 @@ index 87b7ef7..f1eea07 100644
  };
  
  /* What the window takes from SDL, and gives back on every way out. */
-@@ -127,10 +129,9 @@ static void publish(uint32_t bpp)
+@@ -127,10 +141,9 @@ static void publish(uint32_t bpp)
      }
  }
  
@@ -8109,7 +8375,7 @@ index 87b7ef7..f1eea07 100644
      uint32_t bpp = pitch / FB_W, y;
      size_t need;
  
-@@ -144,13 +145,61 @@ static void present_copy(uint32_t fb_va, uint32_t pitch)
+@@ -144,13 +157,61 @@ static void present_copy(uint32_t fb_va, uint32_t pitch)
          s->px = n;
          s->cap = need;
      }
@@ -8172,7 +8438,7 @@ index 87b7ef7..f1eea07 100644
  /* Called by the pushbuffer executor when the title flips. */
  void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
  {
-@@ -165,6 +214,352 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
+@@ -165,6 +226,364 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
      __atomic_sub_fetch(&s_in_present, 1, __ATOMIC_SEQ_CST);
  }
  
@@ -8320,7 +8586,19 @@ index 87b7ef7..f1eea07 100644
 +
 +static void settings_path(char *out, size_t n, int dir_only)
 +{
++#if defined(_WIN32)
++    /* Windows: %LOCALAPPDATA%\xboxrecomp, beside the saves. */
++    const char *x = getenv("LOCALAPPDATA"), *h = getenv("USERPROFILE");
++    if (x && *x) {
++        snprintf(out, n, "%s\\xboxrecomp%s", x, dir_only ? "" : "\\settings.ini");
++        return;
++    }
++    if (!h) h = ".";
++    snprintf(out, n, "%s\\xboxrecomp%s", h, dir_only ? "" : "\\settings.ini");
++    return;
++#else
 +    const char *x = getenv("XDG_CONFIG_HOME"), *h = getenv("HOME");
++#endif
 +    if (x && *x)
 +        snprintf(out, n, "%s/xboxrecomp%s", x, dir_only ? "" : "/settings.ini");
 +    else
@@ -8525,7 +8803,31 @@ index 87b7ef7..f1eea07 100644
  /* Title bar: "<XBE title> | FPS: n | draws: n", as the GDI window shows it.
   * Written by the loader and the flip, read once a second by the main
   * thread; a torn read shows one stale value for a second. */
-@@ -261,6 +656,66 @@ static int start_guest(void)
+@@ -230,15 +649,19 @@ static int start_guest(void)
+ {
+     pthread_attr_t attr;
+     pthread_t th;
+-    struct rlimit rl;
+     size_t stack = 64u << 20;
+     int rc;
+ 
++#if !defined(_WIN32)
+     /* At least the main thread's stack (8 MB by default), and generously
+      * more: lifted code recurses on the native stack. */
+-    if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY
+-            && rl.rlim_cur > stack)
+-        stack = (size_t)rl.rlim_cur;
++    {
++        struct rlimit rl;
++        if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY
++                && rl.rlim_cur > stack)
++            stack = (size_t)rl.rlim_cur;
++    }
++#endif
+ 
+     pthread_attr_init(&attr);
+     pthread_attr_setstacksize(&attr, stack);
+@@ -261,6 +684,66 @@ static int start_guest(void)
      return 1;
  }
  
@@ -8592,7 +8894,7 @@ index 87b7ef7..f1eea07 100644
  /* ── The window, on the process main thread ───────────────────────────── */
  
  static int env_on(const char *name)
-@@ -274,7 +729,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+@@ -274,7 +757,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
      SDL_Window *win;
      SDL_Renderer *ren;
      SDL_Texture *tex = NULL;
@@ -8601,7 +8903,7 @@ index 87b7ef7..f1eea07 100644
      uint64_t shown_seq = 0, t_title = 0, flips_title = 0;
      const char *e;
      int vsync, scale, quit = 0, guest_done = 0, dirty = 1;
-@@ -285,6 +740,12 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+@@ -285,6 +768,12 @@ int xbox_HostWindowMain(int (*guest_main)(void))
      SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
      if (!env_on("RECOMP_FB_WINDOW") || env_on("RECOMP_HEADLESS"))
          return guest_main();
@@ -8614,7 +8916,7 @@ index 87b7ef7..f1eea07 100644
  
      e = getenv("RECOMP_PRESENT_VSYNC");
      vsync = !e || env_on("RECOMP_PRESENT_VSYNC");
-@@ -293,7 +754,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+@@ -293,7 +782,7 @@ int xbox_HostWindowMain(int (*guest_main)(void))
      if (scale < 1 || scale > 8)
          scale = 2;
  
@@ -8623,7 +8925,7 @@ index 87b7ef7..f1eea07 100644
      if (SDL_Init(FBWIN_SDL_SUBSYSTEMS) != 0) {
          fprintf(stderr, "  [FBWIN] SDL video unavailable (%s); running headless\n",
                  SDL_GetError());
-@@ -301,7 +762,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+@@ -301,7 +790,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
      }
      win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                             (int)FB_W * scale, (int)FB_H * scale,
@@ -8633,7 +8935,7 @@ index 87b7ef7..f1eea07 100644
      ren = win ? SDL_CreateRenderer(win, -1,
                                     vsync ? SDL_RENDERER_PRESENTVSYNC : 0)
                : NULL;
-@@ -314,6 +776,29 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+@@ -314,6 +804,29 @@ int xbox_HostWindowMain(int (*guest_main)(void))
          return guest_main();
      }
      SDL_RenderSetLogicalSize(ren, (int)FB_W, (int)FB_H);
@@ -8663,7 +8965,7 @@ index 87b7ef7..f1eea07 100644
      {
          SDL_RendererInfo ri;
          if (SDL_GetRendererInfo(ren, &ri) == 0)
-@@ -347,7 +832,12 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+@@ -347,7 +860,12 @@ int xbox_HostWindowMain(int (*guest_main)(void))
          return guest_main();
      }
  
@@ -8676,7 +8978,7 @@ index 87b7ef7..f1eea07 100644
          SDL_Event ev;
          uint64_t seq, now;
          const uint8_t *px = NULL;
-@@ -359,21 +849,68 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+@@ -359,21 +877,68 @@ int xbox_HostWindowMain(int (*guest_main)(void))
          if (SDL_WaitEventTimeout(&ev, shown_seq ? 100 : 16)) {
              do {
                  /* Keys for the pad stand-in, and the window events that
@@ -8747,7 +9049,7 @@ index 87b7ef7..f1eea07 100644
          pthread_mutex_lock(&s_lock);
          seq = s_ready_seq;
          if (seq != shown_seq) {
-@@ -384,26 +921,57 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+@@ -384,26 +949,57 @@ int xbox_HostWindowMain(int (*guest_main)(void))
          pthread_mutex_unlock(&s_lock);
  
          if (seq != shown_seq) {
@@ -8809,7 +9111,7 @@ index 87b7ef7..f1eea07 100644
              }
              if (tex)
                  SDL_UpdateTexture(tex, NULL, px, (int)pitch);
-@@ -415,6 +983,14 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+@@ -415,6 +1011,14 @@ int xbox_HostWindowMain(int (*guest_main)(void))
              SDL_RenderClear(ren);
              if (tex)
                  SDL_RenderCopy(ren, tex, NULL, NULL);
@@ -8824,6 +9126,25 @@ index 87b7ef7..f1eea07 100644
              SDL_RenderPresent(ren);
          }
  
+@@ -458,4 +1062,4 @@ int xbox_HostWindowMain(int (*guest_main)(void))
+     return s_guest_rc;
+ }
+ 
+-#endif /* !_WIN32 */
++#endif /* !_WIN32 || XBOX_SDL_HOST */
+diff --git a/src/video/video_player.c b/src/video/video_player.c
+index 18d2633..adb74ce 100644
+--- a/src/video/video_player.c
++++ b/src/video/video_player.c
+@@ -14,7 +14,7 @@
+  * Media Foundation session on one thread, so nothing here touches the guest's
+  * execution or its memory.
+  */
+-#if defined(_WIN32)
++#if defined(_WIN32) && !defined(XBOX_SDL_HOST)   /* SDL host: no MF (absent on Windows N) */
+ #define COBJMACROS
+ #include <windows.h>
+ #include <mfapi.h>
 diff --git a/src/video/video_player.h b/src/video/video_player.h
 index a5b912c..0327cc1 100644
 --- a/src/video/video_player.h
@@ -8838,6 +9159,19 @@ index a5b912c..0327cc1 100644
  #endif
  
  #endif /* BURNOUT3_VIDEO_PLAYER_H */
+diff --git a/src/video/video_pump.c b/src/video/video_pump.c
+index 6fdf222..8840801 100644
+--- a/src/video/video_pump.c
++++ b/src/video/video_pump.c
+@@ -9,7 +9,7 @@
+  * The guest decides when. A title opens its movie file at the point its own
+  * logic reaches the intro; the runtime notices that open and plays that file.
+  */
+-#if defined(_WIN32)
++#if defined(_WIN32) && !defined(XBOX_SDL_HOST)
+ #define COBJMACROS
+ #include <windows.h>
+ #include <stdio.h>
 diff --git a/tools/xbe_parser/xbe_parser.py b/tools/xbe_parser/xbe_parser.py
 index 465a0af..94a7a2a 100644
 --- a/tools/xbe_parser/xbe_parser.py
