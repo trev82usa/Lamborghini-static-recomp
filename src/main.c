@@ -1,0 +1,1175 @@
+#if !defined(_WIN32)
+#define _GNU_SOURCE   /* dladdr, REG_RIP */
+#endif
+#include <stdint.h>
+/**
+ * Lamborghini - Recompiled Game Entry Point
+ *
+ * This is the Windows executable that hosts the recompiled game code.
+ * It performs the following initialization sequence:
+ *
+ * 1. Load the original XBE file from disk
+ * 2. Initialize the Xbox memory layout (map data sections to original VAs)
+ * 3. Initialize the Xbox kernel replacement layer
+ * 4. Initialize the kernel bridge (thunk table in Xbox memory)
+ * 5. Set up game file paths for I/O redirection
+ * 6. Initialize the stack pointer
+ * 7. Install VEH crash handler for diagnostics
+ * 8. Call the game's original entry point (recompiled)
+ *
+ * Customize this file for your game:
+ *   - Set YOUR_GAME_ENTRY_POINT to the XBE entry point address
+ *   - Set YOUR_GAME_XBE_PATH to where the XBE file lives
+ *   - Set YOUR_GAME_DIR to the game data directory
+ *   - Add any CRT global pre-initialization your game needs
+ *   - Customize the VEH handler for game-specific crash diagnosis
+ *
+ * XBE Details (fill in from xbe_parser output):
+ *   Title:       Lamborghini
+ *   Title ID:    0x00000000
+ *   Base addr:   0x00010000
+ *   Entry point: 0x00000000
+ *   Code size:   ~??? KB (.text)
+ *   Sections:    ?? (list them)
+ *   Kernel imports: ??
+ */
+
+#if defined(_WIN32)
+#include <windows.h>
+#include <dbghelp.h>
+#else
+/* Native Linux: the toolkit's POSIX implementation of the Win32 primitives
+ * this file uses (threads, Sleep, GetTickCount). */
+#include "platform/win32_compat.h"
+#include <dlfcn.h>
+#include <signal.h>
+#include <ucontext.h>
+#include <unistd.h>
+#include <ctype.h>
+#include <sys/time.h>
+#endif
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
+#include <math.h>
+
+#if !defined(_WIN32)
+/* putenv keeps the pointer; every caller here passes a string literal. */
+#define _putenv(s) putenv((char *)(s))
+#define MessageBoxA(h, text, title, flags) \
+    (fprintf(stderr, "[%s] %s\n", (title), (text)), 0)
+#endif
+
+/* xboxrecomp runtime headers */
+#include <xbox/xboxrecomp.h>
+#include "nv2a_backend.h"
+
+/*
+ * If xboxrecomp.h is not an umbrella header in your setup, include
+ * the individual headers directly:
+ *
+ * #include "kernel.h"
+ * #include "xbox_memory_layout.h"
+ * #include "d3d8_xbox.h"
+ * #include "dsound_xbox.h"
+ * #include "xinput_xbox.h"
+ */
+
+/* ── Global register state (defined in xbox_memory_layout.c) ── */
+
+/* RECOMP_TLS is not optional here. The runtime defines these thread-local, and
+ * a plain `extern` referencing a __declspec(thread) variable does not resolve
+ * to the calling thread's copy -- it resolves to the image's TLS template. The
+ * host side then writes g_esp somewhere the generated code never reads, so the
+ * guest starts with every register at zero and faults immediately, having
+ * apparently ignored the setup that visibly ran. */
+extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
+extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+extern RECOMP_TLS uint32_t g_seh_ebp;
+/* x87 and SSE state. Global for the same reason the volatile GPRs are: one
+ * guest routine can lift to several C functions, so a value written in one
+ * body is read in the next. Defined in xbox_memory_layout.c like the rest of
+ * the register file. */
+extern RECOMP_TLS double g_fp_stack[8];
+extern RECOMP_TLS int g_fp_top;
+extern RECOMP_TLS uint16_t g_fp_control_word;
+extern RECOMP_TLS uint32_t g_mxcsr;
+extern RECOMP_TLS int g_fp_cmp;
+extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
+extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
+extern ptrdiff_t g_xbox_mem_offset;
+
+/* Software method 5: the GPU reached the point D3D's pushbuffer-space wait
+ * marked, so set D3D's event at device + 0x1964 (device pointer at
+ * 0x0016AE48), as the console's interrupt handler does. */
+static void lambo_sw_method(uint32_t param)
+{
+    extern void xbox_KeSignalGuestEvent(uint32_t guest_va);
+    uint32_t dev;
+    if ((param & 0x1F) != 5 || !g_xbox_mem_offset)
+        return;
+#ifdef LAMBO_AUDIO_SHIM
+    {
+        extern void Audio_Update(void);
+        Audio_Update();
+    }
+#endif
+    dev = *(volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + 0x0016AE48u);
+    if (dev)
+        xbox_KeSignalGuestEvent(dev + 0x1964u);
+}
+
+/* ── XBE Constants ─────────────────────────────────────────── */
+
+/*
+ * TODO: Set these from your xbe_parser output.
+ * Run: py -3 -m tools.xbe_parser game/default.xbe
+ */
+#define YOUR_GAME_ENTRY_POINT   0x00129B9D  /* XBE entry point VA */
+#if defined(_WIN32)
+#define YOUR_GAME_XBE_PATH      "Lamborghini\\default.xbe"
+#else
+#define YOUR_GAME_XBE_PATH      "Lamborghini/default.xbe"
+#endif
+#define YOUR_GAME_DIR            "Lamborghini"
+
+/* ── Forward declarations ──────────────────────────────────── */
+
+static BOOL load_xbe(const char *path, void **out_data, size_t *out_size);
+
+/* Recompiled entry point (generated by recomp pipeline) */
+extern void xbe_entry_point(void);
+/* Flat dispatch table (recomp_types.h, not included here). */
+extern int recomp_dispatch_init(void);
+
+/* ── VEH crash handler ─────────────────────────────────────── */
+
+/*
+ * Vectored Exception Handler for crash diagnostics.
+ *
+ * When the recompiled game hits an access violation, this handler prints
+ * the faulting address, all Xbox register values, and a native stack trace.
+ * This is your primary debugging tool during bring-up.
+ *
+ * Customize this for your game:
+ *   - Add game-specific address checks (GPU register probes, etc.)
+ *   - Add dumps of game-specific globals (heap handles, state flags)
+ *   - Add SEH simulation if your game uses __try/__except
+ */
+/* Name the guest function a fault happened in, and recover the call chain.
+ *
+ * Recompiled code faults as ordinary native code, so the exception record
+ * carries a host RIP and nothing else -- there is no guest program counter to
+ * report, and the host address changes every build. Two things recover the
+ * guest view:
+ *
+ *   - every generated function is a real symbol in the image (sub_005A03C0
+ *     and so on), so the linker's PDB already maps host address back to guest
+ *     function. dbghelp turns an anonymous RIP into that name.
+ *
+ *   - every lifted call pushes its guest return address onto the guest stack
+ *     before jumping, so the stack still holds the chain. Scanning up from esp
+ *     for values inside the code sections recovers it.
+ *
+ * ponytail: the stack scan is a scan, not a frame walk -- these are FPO frames
+ * with no reliable ebp chain, so there is nothing to walk. It over-reports,
+ * since addresses from returned-from calls linger below esp, but naming the
+ * guest function is the whole question at a fault.
+ *
+ * Requires linking dbghelp and keeping the .pdb beside the .exe.
+ */
+static void print_guest_context(void *rip)
+{
+#if defined(_WIN32)
+    /* SYMBOL_INFO is variable-length: the name is written past the struct, so
+     * it must be over-allocated with MaxNameLen set to the slack. */
+    char buf[sizeof(SYMBOL_INFO) + 256];
+    SYMBOL_INFO *sym = (SYMBOL_INFO *)buf;
+    DWORD64 disp = 0;
+
+    memset(buf, 0, sizeof(buf));
+    sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+    sym->MaxNameLen = 255;
+    if (SymFromAddr(GetCurrentProcess(), (DWORD64)(uintptr_t)rip, &disp, sym))
+        fprintf(stderr, "  in %s+0x%llX\n",
+                sym->Name, (unsigned long long)disp);
+#else
+    /* Linked with -rdynamic, so the generated functions are in the dynamic
+     * symbol table and dladdr names them. */
+    Dl_info di;
+    if (dladdr(rip, &di) && di.dli_sname)
+        fprintf(stderr, "  in %s+0x%llX\n", di.dli_sname,
+                (unsigned long long)((uintptr_t)rip - (uintptr_t)di.dli_saddr));
+#endif
+
+    if (g_xbox_mem_offset && g_esp) {
+        const uint32_t *sp =
+            (const uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp);
+        int shown = 0, i;
+        fprintf(stderr, "  guest stack (return addresses, innermost first):\n");
+        for (i = 0; i < 256 && shown < 24; i++) {
+            uint32_t v = sp[i];
+            if (v > g_xbox_code_lo && v < g_xbox_code_hi) {
+                fprintf(stderr, "    [esp+%-4d] 0x%08X\n", i * 4, v);
+                shown++;
+            }
+        }
+        /* When the frame is gone, say so, and fall back on what is left.
+         *
+         * A fault inside a block copy leaves no return address in range: the
+         * copy is a host memmove and its caller's frame is further up than
+         * this reaches. Worse, a copy that ran past its buffer overwrites the
+         * stack itself, so the list comes out empty exactly when it is most
+         * needed -- and an empty list under a promising heading reads like
+         * "nothing to see" rather than "the evidence is destroyed". */
+        if (!shown)
+            fprintf(stderr, "    (no return addresses in range)\n");
+
+        /* Everything below only pays for itself when the scan came back
+         * empty. A crash where the chain was recovered already says what
+         * happened, and burying that under another twenty lines makes the
+         * common report worse to read. */
+        if (!shown) {
+            uint32_t k;
+
+            /* The indirect-call history, which the stack cannot overwrite.
+             * recomp_manual.c prints this too, but only from
+             * recomp_icall_fail_log -- a page fault inside a block copy
+             * never reaches that path, and this is the same information by
+             * the route the fault actually took.
+             *
+             * Declared here rather than included: main.c does not pull in
+             * recomp_types.h, and recomp_manual.c spells it the same way. */
+            extern volatile uint32_t g_icall_trace[16];
+            extern volatile uint32_t g_icall_trace_idx;
+
+            fprintf(stderr, "  recent ICALL targets:");
+            for (k = 0; k < 16; k++)
+                fprintf(stderr, " %08X",
+                        g_icall_trace[(g_icall_trace_idx + k) & 15]);
+            fprintf(stderr, "\n");
+
+            /* The frame unfiltered. The pointers and lengths handed to
+             * whatever faulted live here and look nothing like code, so the
+             * filter above drops exactly what is wanted. On the crash this
+             * was written for, one of these words was the end of the mapped
+             * RAM mirror -- which is what identified the fault as a copy
+             * running off its buffer rather than a stray pointer. */
+            for (i = 0; i < 20; i++)
+                fprintf(stderr, "    raw[esp+%-4d] 0x%08X\n", i * 4, sp[i]);
+        }
+    }
+}
+
+/* The emulated APU.
+ *
+ * Two entry points that had no callers anywhere in the tree. apu_mmio_hook.c
+ * documents apu_hook_handle_mmio as "called from VEH in main.c" and no main.c
+ * called it; apu_decode_and_handle's first line is `if (!g_apu_state) return
+ * false` and nothing assigned g_apu_state. So with RECOMP_AC97_READY set the
+ * APU's registers were unmapped to be trapped, and every trap was then
+ * declined and surfaced as an access violation on the first register
+ * DirectSound touched. The VEH below now reaches apu_hook_handle_mmio
+ * through the toolkit's xbox_VehMmioFault.
+ *
+ * Declared rather than included so this does not depend on src/apu being on
+ * the include path. */
+typedef struct MCPXAPUState MCPXAPUState;
+extern MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
+extern MCPXAPUState *g_apu_state;
+
+#if defined(_WIN32)
+static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
+{
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        uintptr_t fault_addr = ep->ExceptionRecord->ExceptionInformation[1];
+
+        /*
+         * GPU register probe at 0xFD000000 range.
+         * Some games probe NV2A registers directly. On real hardware this
+         * returns GPU state; here we just skip the instruction.
+         * TODO: Implement mini x86-64 decoder for instruction skipping,
+         * or connect to the xbox_nv2a library for proper handling.
+         */
+        if (fault_addr >= 0xFD000000 && fault_addr < 0xFE000000) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        /* Trapped hardware registers (APU, USB OHCI) -> their models.
+         *
+         * The other half of RECOMP_AC97_READY: reporting the codec ready is
+         * what lets DirectSoundCreate past its first gate, and from there it
+         * drives the APU directly, so the registers have to fault to be seen.
+         * "Handled" means the access was decoded and the instruction stepped
+         * over, so execution resumes instead of unwinding. */
+        if (xbox_VehMmioFault(ep))
+            return EXCEPTION_CONTINUE_EXECUTION;
+
+        fprintf(stderr, "[CRASH] Access violation at RIP=0x%llX, fault addr=0x%llX (%s)\n",
+            (unsigned long long)ep->ContextRecord->Rip,
+            (unsigned long long)fault_addr,
+            ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read");
+        fprintf(stderr, "  Xbox regs: eax=0x%08X ecx=0x%08X edx=0x%08X esp=0x%08X\n",
+            g_eax, g_ecx, g_edx, g_esp);
+        fprintf(stderr, "  Xbox regs: ebx=0x%08X esi=0x%08X edi=0x%08X\n",
+            g_ebx, g_esi, g_edi);
+        fprintf(stderr, "  Xbox VA of fault: 0x%08X\n",
+            (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset));
+        print_guest_context((void *)ep->ContextRecord->Rip);
+
+        /*
+         * TODO: Add game-specific diagnostics here. Examples:
+         *
+         * Dump CRT heap handle:
+         *   uint32_t heap = *(uint32_t *)((uint8_t *)g_xbox_mem_offset + HEAP_HANDLE_VA);
+         *   fprintf(stderr, "  CRT heap handle: 0x%08X\n", heap);
+         *
+         * Dump game state:
+         *   uint32_t state = *(uint32_t *)((uint8_t *)g_xbox_mem_offset + GAME_STATE_VA);
+         *   fprintf(stderr, "  Game state: %u\n", state);
+         */
+
+        /* Print native stack return addresses for debugging */
+        {
+            uintptr_t *sp = (uintptr_t *)ep->ContextRecord->Rsp;
+            fprintf(stderr, "  Native stack (first 8 return addrs):\n");
+            for (int i = 0; i < 64 && sp[i]; i++) {
+                if (sp[i] >= 0x140000000ULL && sp[i] < 0x150000000ULL) {
+                    fprintf(stderr, "    [%d] 0x%llX\n", i, (unsigned long long)sp[i]);
+                }
+            }
+        }
+        fflush(stderr);
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#else
+/* POSIX counterpart of veh_handler: SIGSEGV/SIGBUS. Trapped hardware
+ * registers (APU, AC'97, USB OHCI) are serviced and the thread resumes past
+ * the instruction; anything else is reported and the default action (core
+ * dump) taken. */
+static void posix_fault_handler(int sig, siginfo_t *si, void *ucv)
+{
+    ucontext_t *uc = (ucontext_t *)ucv;
+    uintptr_t fault_addr = (uintptr_t)si->si_addr;
+    uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+    int is_write = (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0;
+
+    if ((sig == SIGSEGV || sig == SIGBUS) && xbox_PosixMmioFault(ucv, fault_addr))
+        return;
+
+    fprintf(stderr, "[CRASH] signal %d at RIP=0x%llX, fault addr=0x%llX (%s)\n",
+        sig, (unsigned long long)rip, (unsigned long long)fault_addr,
+        is_write ? "write" : "read");
+    fprintf(stderr, "  Xbox regs: eax=0x%08X ecx=0x%08X edx=0x%08X esp=0x%08X\n",
+        g_eax, g_ecx, g_edx, g_esp);
+    fprintf(stderr, "  Xbox regs: ebx=0x%08X esi=0x%08X edi=0x%08X\n",
+        g_ebx, g_esi, g_edi);
+    fprintf(stderr, "  Xbox VA of fault: 0x%08X\n",
+        (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset));
+    print_guest_context((void *)rip);
+    fflush(stderr);
+
+    /* Back to the default action so the fault is not retried forever. */
+    signal(sig, SIG_DFL);
+}
+
+static void install_posix_fault_handler(void)
+{
+    struct sigaction sa;
+    /* Alternate stack: a fault from a guest stack overflow still reports. */
+    static char altstack[1 << 16];
+    stack_t ss;
+    ss.ss_sp = altstack;
+    ss.ss_size = sizeof altstack;
+    ss.ss_flags = 0;
+    sigaltstack(&ss, NULL);
+
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = posix_fault_handler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    /* An integer divide by zero in guest code (SIGFPE) and an illegal
+     * instruction report the same way; they used to end the process with
+     * nothing in the log. */
+    sigaction(SIGFPE, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+}
+#endif
+
+
+/* Lamborghini's D3D (XDK 5028) waits on a fence word that the GPU's
+ * BACK_END_WRITE_SEMAPHORE_RELEASE updates. The device keeps a pointer to that
+ * word at +0x30; the device itself is at [0x0016AE48]. */
+static uint32_t lambo_semaphore_va(void)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t dev = *(const uint32_t *)(mem + 0x0016AE48);
+    uint32_t sem;
+    if (dev < 0x1000 || dev >= 0x08000000)
+        return 0;
+    sem = *(const uint32_t *)(mem + dev + 0x30);
+    if (sem >= 0x80000000u && sem < 0x88000000u)
+        return sem;
+    return 0;
+}
+
+/* Bring-up diagnostic: sample the D3D device's pushbuffer bookkeeping while
+ * the title waits on the GPU. Device pointer lives at 0x0016AE48 in this XBE. */
+
+/* LAMBO_PAD_PEEK: what the game's own pad table (0x358050, 0xDC per pad)
+ * holds, twice a second, printed only when it changes. */
+static DWORD WINAPI lambo_pad_peek(LPVOID unused)
+{
+    char last[256] = "";
+    (void)unused;
+    for (;;) {
+        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+        const uint8_t *p = mem + 0x358050;
+        char line[256];
+        int i, n;
+        Sleep(250);
+        n = snprintf(line, sizeof line, "[PADPEEK] btn=%04X analog=",
+                     *(const uint16_t *)p);
+        for (i = 0; i < 8; i++)
+            n += snprintf(line + n, sizeof line - n, "%02X ", p[2 + i]);
+        n += snprintf(line + n, sizeof line - n, "edge=%04X flags=",
+                      *(const uint16_t *)(mem + 0x358050 + 0x48));
+        for (i = 0; i < 8; i++)
+            n += snprintf(line + n, sizeof line - n, "%u",
+                          *(const uint32_t *)(mem + 0x358078 + i * 4) & 1);
+        {
+            uint32_t h = *(const uint32_t *)(mem + 0x358120);
+            if (h >= 0x1000 && h < 0x08000000)
+                n += snprintf(line + n, sizeof line - n,
+                              " h=%08X state=%04X %02X %02X %02X raw=%02X %02X %02X %02X %02X %02X len=%u fl=%02X",
+                              h, *(const uint16_t *)(mem + h + 0x14),
+                              mem[h + 0x16], mem[h + 0x17], mem[h + 0x18],
+                              mem[h + 0x32], mem[h + 0x33], mem[h + 0x34],
+                              mem[h + 0x35], mem[h + 0x36], mem[h + 0x37],
+                              *(const uint32_t *)(mem + h + 0x66), mem[h + 0xa2]);
+            else
+                n += snprintf(line + n, sizeof line - n, " h=%08X", h);
+        }
+        if (strcmp(line, last)) {
+            fprintf(stderr, "%s\n", line);
+            fflush(stderr);
+            strcpy(last, line);
+        }
+    }
+    return 0;
+}
+
+/* LAMBO_PROFILE=1: a sampling profiler. About every millisecond, every other
+ * thread of the process is suspended and its RIP recorded; every 10 s the
+ * hottest addresses (4 KB buckets) are printed as host addresses, which
+ * `nm -n Lamborghini.exe` turns into functions. perf is not available to an
+ * ordinary user on a locked-down kernel, and this is enough to say where the
+ * frame time goes. */
+#define PROF_BUCKETS (1 << 20)   /* 64-byte buckets over 64 MB */
+#if defined(_WIN32)
+#include <tlhelp32.h>
+#include <mmsystem.h>
+static DWORD WINAPI lambo_profiler(LPVOID unused)
+{
+    static uint32_t hits[PROF_BUCKETS];   /* (rip - image base) >> 6 */
+    #define OUT_SLOTS 65536
+    static uint64_t out_key[OUT_SLOTS];
+    static uint32_t out_hits[OUT_SLOTS];
+    uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    DWORD last = GetTickCount();
+    uint32_t total = 0, outside = 0;
+    (void)unused;
+    timeBeginPeriod(1);
+    for (;;) {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        THREADENTRY32 te;
+        te.dwSize = sizeof te;
+        if (snap != INVALID_HANDLE_VALUE && Thread32First(snap, &te)) {
+            do {
+                HANDLE h;
+                CONTEXT c;
+                if (te.th32OwnerProcessID != pid || te.th32ThreadID == me)
+                    continue;
+                h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
+                               FALSE, te.th32ThreadID);
+                if (!h)
+                    continue;
+                if (SuspendThread(h) != (DWORD)-1) {
+                    c.ContextFlags = CONTEXT_CONTROL;
+                    if (GetThreadContext(h, &c)) {
+                        uintptr_t off = (uintptr_t)c.Rip - base;
+                        /* A thread blocked in the kernel or a host DLL is
+                         * waiting, not working; count it apart. */
+                        if (off < (uintptr_t)PROF_BUCKETS << 6)
+                            hits[off >> 6]++, total++;
+                        else {
+                            /* Outside the image: remember the address so the
+                             * report can name the DLL. Open-addressed table
+                             * of 64-byte buckets. */
+                            uint64_t key = (uint64_t)c.Rip >> 6;
+                            uint32_t slot = (uint32_t)(key * 2654435761u) & (OUT_SLOTS - 1);
+                            int probe;
+                            for (probe = 0; probe < 32; probe++) {
+                                uint32_t q = (slot + probe) & (OUT_SLOTS - 1);
+                                if (!out_key[q] || out_key[q] == key) {
+                                    out_key[q] = key; out_hits[q]++;
+                                    break;
+                                }
+                            }
+                            outside++;
+                        }
+                    }
+                    ResumeThread(h);
+                }
+                CloseHandle(h);
+            } while (Thread32Next(snap, &te));
+        }
+        if (snap != INVALID_HANDLE_VALUE)
+            CloseHandle(snap);
+        Sleep(1);
+        if (GetTickCount() - last >= 10000) {
+            int k, i;
+            last = GetTickCount();
+            fprintf(stderr, "[PROF] %u samples in the image, %u outside; top:",
+                    total, outside);
+            for (k = 0; k < 30; k++) {
+                int best = -1;
+                for (i = 0; i < PROF_BUCKETS; i++)
+                    if (hits[i] && (best < 0 || hits[i] > hits[best]))
+                        best = i;
+                if (best < 0)
+                    break;
+                fprintf(stderr, " %llX:%u",
+                        (unsigned long long)(base + ((uintptr_t)best << 6)),
+                        hits[best]);
+                hits[best] = 0;
+            }
+            fprintf(stderr, "\n[PROF] outside:");
+            for (k = 0; k < 20; k++) {
+                int best = -1;
+                for (i = 0; i < OUT_SLOTS; i++)
+                    if (out_hits[i] && (best < 0 || out_hits[i] > out_hits[best]))
+                        best = i;
+                if (best < 0)
+                    break;
+                {
+                    HMODULE m = NULL;
+                    char name[MAX_PATH] = "?";
+                    uintptr_t a = (uintptr_t)(out_key[best] << 6);
+                    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                                           | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                           (LPCSTR)a, &m) && m) {
+                        char *b;
+                        GetModuleFileNameA(m, name, sizeof name);
+                        b = strrchr(name, '\\');
+                        if (b) memmove(name, b + 1, strlen(b));
+                    }
+                    fprintf(stderr, " %s+%llX:%u", name,
+                            (unsigned long long)(a - (uintptr_t)m), out_hits[best]);
+                }
+                out_hits[best] = 0;
+            }
+            fprintf(stderr, "\n");
+            memset(out_key, 0, sizeof out_key);
+            memset(out_hits, 0, sizeof out_hits);
+            memset(hits, 0, sizeof hits);
+            total = outside = 0;
+        }
+    }
+    return 0;
+}
+#else
+/* POSIX: wall-clock sampling per thread, like the Windows version (which
+ * suspends each thread and reads its RIP). A sampler thread sends SIGPROF to
+ * every thread of the process about once a millisecond with tgkill; each
+ * thread records its own RIP in its own table, so the handler needs no lock.
+ * A thread blocked in a wait shows up in libc (pthread_cond_*, nanosleep,
+ * futex), which is what tells waiting from working. Every 10 s each thread's
+ * hottest functions are printed by symbol (dladdr; the exe is linked with
+ * -rdynamic). */
+#include <dirent.h>
+#include <sys/syscall.h>
+#define PT_THREADS 48
+#define PT_SLOTS   4096
+typedef struct {
+    volatile pid_t tid;
+    char name[16];
+    volatile uint32_t total;
+    uint64_t key[PT_SLOTS];
+    uint32_t cnt[PT_SLOTS];
+} ProfThread;
+static ProfThread s_pt[PT_THREADS];
+
+static void prof_signal(int sig, siginfo_t *si, void *ucv)
+{
+    pid_t me = (pid_t)syscall(SYS_gettid);
+    uint64_t key = (uint64_t)((ucontext_t *)ucv)->uc_mcontext.gregs[REG_RIP] >> 4;
+    int i, probe;
+    (void)sig; (void)si;
+    for (i = 0; i < PT_THREADS; i++)
+        if (s_pt[i].tid == me)
+            break;
+    if (i == PT_THREADS)
+        return;
+    s_pt[i].total++;
+    for (probe = 0; probe < 64; probe++) {
+        uint32_t q = (uint32_t)((key * 2654435761u) + probe) & (PT_SLOTS - 1);
+        if (!s_pt[i].key[q] || s_pt[i].key[q] == key) {
+            s_pt[i].key[q] = key;
+            s_pt[i].cnt[q]++;
+            return;
+        }
+    }
+}
+
+/* Name of the function containing host address a: symbol, else library. */
+static void prof_name(uintptr_t a, char *out, size_t n)
+{
+    Dl_info d;
+    if (dladdr((void *)a, &d) && d.dli_sname)
+        snprintf(out, n, "%s", d.dli_sname);
+    else if (d.dli_fname) {
+        const char *b = strrchr(d.dli_fname, '/');
+        snprintf(out, n, "%s+%llx", b ? b + 1 : d.dli_fname,
+                 (unsigned long long)(a - (uintptr_t)d.dli_fbase));
+    } else
+        snprintf(out, n, "%llx", (unsigned long long)a);
+}
+
+static DWORD WINAPI lambo_profiler(LPVOID unused)
+{
+    struct sigaction sa;
+    pid_t pid = getpid(), self = (pid_t)syscall(SYS_gettid);
+    DWORD last = GetTickCount();
+    unsigned tick = 0;
+    (void)unused;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = prof_signal;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigaction(SIGPROF, &sa, NULL);
+    for (;;) {
+        DIR *d = opendir("/proc/self/task");
+        struct dirent *e;
+        while (d && (e = readdir(d))) {
+            pid_t t = (pid_t)atoi(e->d_name);
+            int i, freeslot = -1;
+            if (t <= 0 || t == self)
+                continue;
+            for (i = 0; i < PT_THREADS; i++) {
+                if (s_pt[i].tid == t) break;
+                if (!s_pt[i].tid && freeslot < 0) freeslot = i;
+            }
+            if (i == PT_THREADS) {
+                char path[64];
+                FILE *f;
+                if (freeslot < 0) continue;
+                i = freeslot;
+                snprintf(path, sizeof path, "/proc/self/task/%d/comm", (int)t);
+                f = fopen(path, "r");
+                s_pt[i].name[0] = 0;
+                if (f) {
+                    if (fgets(s_pt[i].name, sizeof s_pt[i].name, f))
+                        s_pt[i].name[strcspn(s_pt[i].name, "\n")] = 0;
+                    fclose(f);
+                }
+                s_pt[i].tid = t;
+            }
+            syscall(SYS_tgkill, pid, t, SIGPROF);
+        }
+        if (d) closedir(d);
+        Sleep(1);
+        tick++;
+        if (GetTickCount() - last >= 10000) {
+            int i;
+            last = GetTickCount();
+            fprintf(stderr, "[PROF] per-thread wall-clock samples over 10 s (%u ticks):\n", tick);
+            tick = 0;
+            for (i = 0; i < PT_THREADS; i++) {
+                ProfThread *p = &s_pt[i];
+                int k;
+                char line[1400];
+                int n;
+                if (!p->tid || !p->total)
+                    continue;
+                n = snprintf(line, sizeof line, "[PROF]  tid %d %-15s %5u:",
+                             (int)p->tid, p->name, p->total);
+                /* Merge buckets by function name (one lookup per bucket),
+                 * take the top 8. The old nested merge did a lookup per
+                 * bucket pair -- millions in a race -- and stalled the
+                 * sampler for most of the next window. */
+                {
+                    static char nms[PT_SLOTS][64];
+                    static uint32_t sums[PT_SLOTS];
+                    int nu = 0, q2, r2;
+                    for (q2 = 0; q2 < PT_SLOTS; q2++) {
+                        char nm[64];
+                        if (!p->cnt[q2]) continue;
+                        prof_name((uintptr_t)(p->key[q2] << 4), nm, sizeof nm);
+                        for (r2 = 0; r2 < nu && strcmp(nms[r2], nm); r2++)
+                            ;
+                        if (r2 == nu) { strcpy(nms[nu], nm); sums[nu] = 0; nu++; }
+                        sums[r2] += p->cnt[q2];
+                    }
+                    for (k = 0; k < 8; k++) {
+                        int best = -1;
+                        for (q2 = 0; q2 < nu; q2++)
+                            if (sums[q2] && (best < 0 || sums[q2] > sums[best]))
+                                best = q2;
+                        if (best < 0) break;
+                        n += snprintf(line + n, sizeof line - n, " %s %u%%;", nms[best],
+                                      (unsigned)(sums[best] * 100u / p->total));
+                        sums[best] = 0;
+                    }
+                }
+                fprintf(stderr, "%s\n", line);
+                memset(p->key, 0, sizeof p->key);
+                memset(p->cnt, 0, sizeof p->cnt);
+                p->total = 0;
+            }
+        }
+    }
+    return 0;
+}
+#endif
+
+/* LAMBO_STACK_SAMPLE=<ms>: every <ms>, print the guest thread's call chain
+ * (return addresses found on its stack) and the pad button word. A hang that
+ * still draws has no crash to read; this says which loop the title is in.
+ * The guest registers are thread-local, so WinMain hands over its copies. */
+static volatile uint32_t *s_sample_esp;
+static DWORD WINAPI lambo_stack_sampler(LPVOID arg)
+{
+    DWORD ms = (DWORD)(uintptr_t)arg;
+    char last[768] = "";
+    for (;;) {
+        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+        uint32_t esp = *s_sample_esp;
+        char line[768];
+        int n, i, shown = 0;
+        Sleep(ms);
+        if (!mem || esp < 0x1000 || esp >= 0x08000000)
+            continue;
+        n = snprintf(line, sizeof line, "[STACK] btn=%04X a=%02X esp=%08X:",
+                     *(const uint16_t *)(mem + 0x358050), mem[0x358052], esp);
+        for (i = 0; i < 1024 && shown < 20 && n < (int)sizeof line - 12; i++) {
+            uint32_t v = *(const uint32_t *)(mem + esp + i * 4);
+            if (v > g_xbox_code_lo && v < g_xbox_code_hi) {
+                n += snprintf(line + n, sizeof line - n, " %08X", v);
+                shown++;
+            }
+        }
+        /* D3D's visibility-test records: device+0x398 is a table of pages,
+         * 16 bytes per test (stamp, stamp, count, status; status
+         * 0xFFFFFFFF = not reported yet). */
+        {
+            uint32_t dev = *(const uint32_t *)(mem + 0x0016AE48);
+            if (dev >= 0x1000 && dev < 0x08000000) {
+                uint32_t pg = *(const uint32_t *)(mem + dev + 0x398);
+                n += snprintf(line + n, sizeof line - n, " dev8=%08X vis=%08X",
+                              *(const uint32_t *)(mem + dev + 8), pg);
+                if ((pg >= 0x1000 && pg < 0x08000000) || (pg >= 0x80000000u && pg < 0x88000000u))
+                    for (i = 0; i < 32; i++)
+                        n += snprintf(line + n, sizeof line - n, "%c",
+                                      *(const uint32_t *)(mem + pg + i * 16 + 12)
+                                          == 0xFFFFFFFFu ? 'P' : '.');
+            }
+        }
+        {
+            extern volatile uint32_t g_nv2a_last_report, g_nv2a_report_count;
+            const volatile uint32_t *u = (const volatile uint32_t *)(mem + 0xFD800000u);
+            n += snprintf(line + n, sizeof line - n, " put=%08X get=%08X rep=%u last=%08X raw=",
+                          u[0x40/4], u[0x44/4],
+                          g_nv2a_report_count, g_nv2a_last_report);
+            for (i = 0; i < 6 && n < (int)sizeof line - 10; i++)
+                n += snprintf(line + n, sizeof line - n, "%08X ",
+                              *(const uint32_t *)(mem + esp + i * 4));
+        }
+        /* Print only changes, but always the first of each 10 so a steady
+         * loop still shows up. */
+        {
+            static int same;
+            if (strcmp(line + 20, last + 20) || ++same >= 10) {
+                fprintf(stderr, "%s\n", line);
+                strcpy(last, line);
+                same = 0;
+            }
+        }
+    }
+    return 0;
+}
+
+static DWORD WINAPI lambo_gpu_sampler(LPVOID unused)
+{
+    const uint8_t *mem;
+    int n;
+    (void)unused;
+    for (n = 0; n < 12; n++) {
+        uint32_t dev, getp, getv = 0, put, ev;
+        Sleep(n == 0 ? 3000 : 700);
+        mem = (const uint8_t *)xbox_GetMemoryOffset();
+        dev = *(const uint32_t *)(mem + 0x0016AE48);
+        if (dev < 0x1000 || dev >= 0x08000000) {
+            fprintf(stderr, "[GPUWAIT] dev=%08X (not set)\n", dev);
+            continue;
+        }
+        put  = *(const uint32_t *)(mem + dev + 0x2C);
+        getp = *(const uint32_t *)(mem + dev + 0x30);
+        if (getp) getv = *(const volatile uint32_t *)(mem + getp);
+        ev   = *(const uint32_t *)(mem + dev + 0x1964);
+        {
+            const volatile uint32_t *u = (const volatile uint32_t *)(mem + 0xFD800000u);
+            fprintf(stderr, "[GPUREG] FD800040(PUT)=%08X FD800044(GET)=%08X FD800048=%08X FD800050=%08X\n",
+                    u[0x40/4], u[0x44/4], u[0x48/4], u[0x50/4]);
+        }
+        fprintf(stderr, "[GPUMODE] sw16A9A0=%08X dev+8=%08X dev+17BC=%08X dev+4F8=%08X\n",
+                *(const uint32_t *)(mem + 0x0016A9A0), *(const uint32_t *)(mem + dev + 8),
+                *(const uint32_t *)(mem + dev + 0x17BC), *(const uint32_t *)(mem + dev + 0x4F8));
+        fprintf(stderr, "[GPUWAIT] dev=%08X +0=%08X +4=%08X +2C(put)=%08X +30(getptr)=%08X *getptr=%08X +15AC=%08X +1964=%08X +1968=%08X\n",
+                dev, *(const uint32_t *)(mem + dev), *(const uint32_t *)(mem + dev + 4),
+                put, getp, getv, *(const uint32_t *)(mem + dev + 0x15AC), ev,
+                *(const uint32_t *)(mem + dev + 0x1968));
+        fflush(stderr);
+    }
+    return 0;
+}
+
+/* ── WinMain ───────────────────────────────────────────────── */
+
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
+                   LPSTR lpCmdLine, int nCmdShow)
+{
+    void *xbe_data = NULL;
+    size_t xbe_size = 0;
+
+    (void)hInstance;
+    (void)hPrevInstance;
+    (void)lpCmdLine;
+    (void)nCmdShow;
+
+    /* Run from the exe's own folder so "Lamborghini\\" resolves however it
+     * is launched, and keep all output in a log beside the exe. */
+    {
+        char exe_dir[MAX_PATH];
+#if defined(_WIN32)
+        DWORD n = GetModuleFileNameA(NULL, exe_dir, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            char *slash = strrchr(exe_dir, '\\');
+            if (slash) { *slash = 0; SetCurrentDirectoryA(exe_dir); }
+        }
+#else
+        ssize_t n = readlink("/proc/self/exe", exe_dir, sizeof exe_dir - 1);
+        if (n > 0) {
+            char *slash;
+            exe_dir[n] = 0;
+            slash = strrchr(exe_dir, '/');
+            if (slash) { *slash = 0; if (chdir(exe_dir) != 0) perror("chdir"); }
+        }
+#endif
+        freopen("lamborghini_log.txt", "w", stderr);
+        freopen("lamborghini_log.txt", "a", stdout);
+        setvbuf(stderr, NULL, _IONBF, 0);
+        setvbuf(stdout, NULL, _IONBF, 0);
+    }
+
+    /* Unbuffered output for immediate visibility during debugging */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
+    printf("=== Lamborghini - Static Recompilation ===\n");
+    printf("Loading XBE...\n");
+
+    /* Install VEH handler (first handler in chain) */
+    /* Load symbols up front rather than from inside the handler: at fault
+     * time the process is already in a bad way, and SymInitialize
+     * allocates. Failure is not fatal -- the handler prints no name. */
+#if defined(_WIN32)
+    SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
+    SymInitialize(GetCurrentProcess(), NULL, TRUE);
+    AddVectoredExceptionHandler(1, veh_handler);
+#else
+    install_posix_fault_handler();
+#endif
+
+    /* Step 1: Load XBE */
+    if (!load_xbe(YOUR_GAME_XBE_PATH, &xbe_data, &xbe_size)) {
+        MessageBoxA(NULL, "Failed to load default.xbe.\n"
+                    "Place the game files in the 'game' subdirectory.",
+                    "Recomp", MB_ICONERROR);
+        return 1;
+    }
+    printf("XBE loaded: %zu bytes\n", xbe_size);
+
+    /* Step 2: Initialize Xbox memory layout */
+    printf("Initializing Xbox memory layout...\n");
+    /* The title probes memory by pinning every physical page and then freeing
+     * them all; without reclaim those frees are ignored and nothing is left. */
+    _putenv("RECOMP_HEAP_RECLAIM=1");
+    /* Execute the pushbuffer so fences, and later drawing, actually happen. */
+    if (!getenv("RECOMP_PB_EXEC")) _putenv("RECOMP_PB_EXEC=1");
+    /* Open the game window (off by default in the runtime). */
+    if (!getenv("RECOMP_FB_WINDOW")) _putenv("RECOMP_FB_WINDOW=1");
+    /* 60 Hz vertical-blank interrupts: D3D waits on flip completion. */
+    if (!getenv("RECOMP_VBLANK")) _putenv("RECOMP_VBLANK=paced");
+    /* Hold each flip for the vblank it asked for, as the console does: the
+     * title runs parts of its logic per frame, so unpaced frames above 60 Hz
+     * made it run fast. */
+    if (!getenv("RECOMP_FLIP_PACING")) _putenv("RECOMP_FLIP_PACING=1");
+    /* GPU render scale 2x (sharper, anti-aliased; no fps cost measured on
+     * Black Forest). The F1 menu's saved choice, or RECOMP_GL_SCALE, wins. */
+    if (!getenv("RECOMP_GL_SCALE")) _putenv("RECOMP_GL_SCALE=2");
+    /* AMD (radeonsi): no "optimized" shader variants. The driver compiles
+     * them in the background with uniform values baked in and swaps them in
+     * mid-race; each swap stalled the GPU 100-300 ms at the start of a race
+     * (GPU idle, a ~30 MB allocation each time). Other drivers ignore it; a
+     * user's own AMD_DEBUG wins. */
+    if (!getenv("AMD_DEBUG")) _putenv("AMD_DEBUG=nooptvariant");
+    /* D3D builds its own KEVENTs (pushbuffer-space and vblank waits). */
+    if (!getenv("RECOMP_TITLE_KEVENTS")) _putenv("RECOMP_TITLE_KEVENTS=1");
+    /* Keyboard acts as controller 1 (Enter = Start, etc.). */
+    if (!getenv("RECOMP_KEYBOARD")) _putenv("RECOMP_KEYBOARD=1");
+    /* W/S throttle and brake, smoothed A/D steering. */
+    if (!getenv("RECOMP_KEYBOARD_RACING")) _putenv("RECOMP_KEYBOARD_RACING=1");
+    /* Emulated USB host controller with one pad per host controller (at least
+     * one, which the keyboard also drives), plugged in as they appear, so
+     * multiplayer sees every pad. Opt-in in the runtime. */
+    if (!getenv("RECOMP_USB")) _putenv("RECOMP_USB=1");
+    if (!getenv("RECOMP_USB_PADS")) _putenv("RECOMP_USB_PADS=auto");
+    /* One-CPU dispatch gate: interrupts and DPCs are serialised properly
+     * instead of being held off by a global raised-IRQL count. Without it one
+     * unmatched raise left the count at 1, the USB DPC never ran again and the
+     * pad went silent after its first report. */
+    if (!getenv("RECOMP_DISPATCH_GATE")) _putenv("RECOMP_DISPATCH_GATE=1");
+    /* Sound: report the AC97 codec ready and bring up the emulated APU.
+     * LAMBO_NO_SOUND=1 turns it off if it ever misbehaves. */
+    {
+        /* A copy of the exe renamed to contain "nosound" runs silent. */
+        char me[MAX_PATH] = "";
+#if defined(_WIN32)
+        GetModuleFileNameA(NULL, me, sizeof me);
+        CharLowerA(me);
+#else
+        {
+            ssize_t n = readlink("/proc/self/exe", me, sizeof me - 1);
+            char *c;
+            if (n > 0) me[n] = 0;
+            for (c = me; *c; c++) *c = (char)tolower((unsigned char)*c);
+        }
+#endif
+        if (!getenv("RECOMP_AC97_READY") && !getenv("LAMBO_NO_SOUND")
+                && !strstr(me, "nosound"))
+            _putenv("RECOMP_AC97_READY=1");
+    }
+    /* Bring-up: save what the window shows every ~6 s, beside the exe. */
+    /* Window snapshots: set RECOMP_FB_DUMP / RECOMP_FB_WINDOW_DUMP_EVERY to use. */
+    nv2a_pb_set_semaphore_resolver(lambo_semaphore_va);
+    /* Bring-up diagnostics: report where the guest is if it stalls. */
+    /* Watchdog off by default: it reports and then EXITS after N seconds,
+     * which looked like a crash once the game ran past the splash screen.
+     * Set RECOMP_WATCHDOG_SECS yourself to use it. */
+    xbox_SetTotalRam(XBOX_DEVKIT_RAM); /* pre-release build expects a 128 MB dev kit */
+    if (!xbox_MemoryLayoutInit(xbe_data, xbe_size)) {
+        MessageBoxA(NULL, "Failed to initialize Xbox memory layout.\n"
+                    "The required virtual address range may be unavailable.",
+                    "Recomp", MB_ICONERROR);
+        free(xbe_data);
+        return 1;
+    }
+
+    g_xbox_mem_offset = xbox_GetMemoryOffset();
+    printf("Xbox memory mapped. Offset: 0x%llX\n", (unsigned long long)g_xbox_mem_offset);
+
+    /* Bring up the emulated APU.
+     *
+     * Gated on the same variable that unmaps its registers, because the two
+     * halves are useless apart: a trap with no model declines every access,
+     * and a model nothing traps into never sees a register. The APU walks
+     * Xbox physical RAM to find voice buffers, so it gets the guest RAM
+     * base. */
+    if (getenv("RECOMP_AC97_READY")) {
+        g_apu_state = mcpx_apu_init_standalone((uint8_t *)xbox_GetMemoryBase());
+        fprintf(stderr, "[BOOT] emulated APU %s\n",
+                g_apu_state ? "up" : "FAILED to initialise");
+    }
+
+    /* Step 3: Initialize Xbox kernel */
+    printf("Initializing Xbox kernel replacement...\n");
+    xbox_kernel_init();
+
+    /* Step 4: Set game directory for file I/O path translation */
+    {
+        extern void xbox_path_init(const char *game_dir, const char *save_dir);
+        xbox_path_init(YOUR_GAME_DIR, NULL);
+    }
+
+    /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */
+    printf("Initializing kernel bridge...\n");
+    xbox_kernel_bridge_init();
+
+    /* Step 6: Initialize stack */
+    g_esp = XBOX_STACK_TOP;
+
+    /*
+     * TODO: Pre-initialize CRT globals if needed.
+     *
+     * Many Xbox games use the MSVC CRT. The CRT's __heap_init sets up a
+     * heap descriptor at a game-specific address. You may need to
+     * pre-initialize __active_heap to avoid small-block heap issues:
+     *
+     *   uint32_t *active_heap = (uint32_t *)((uint8_t *)g_xbox_mem_offset + ACTIVE_HEAP_VA);
+     *   *active_heap = 1;  // 1 = system heap (HeapAlloc), avoids SBH init
+     *
+     * Find ACTIVE_HEAP_VA by searching the disassembly for __heap_init
+     * or by looking for the CRT's __active_heap global in the data section.
+     */
+
+    printf("\n=== Initialization complete ===\n");
+    printf("Entry point: 0x%08X\n", YOUR_GAME_ENTRY_POINT);
+    printf("ESP: 0x%08X\n", g_esp);
+
+    /* Build the flat dispatch table before the guest runs.
+     *
+     * Without this recomp_lookup falls back to a binary search over the
+     * whole function table -- roughly log2(n) branches on *every*
+     * indirect call, which for a 45,000-function C++ title is about 16
+     * every time the game goes through a vtable. Half-Life 2 spent most
+     * of its static initialisation inside recomp_lookup for exactly this
+     * reason, and it read as a hang.
+     *
+     * Optional by design: if the allocation fails the search still works,
+     * so a failure is worth one line and not a fatal error. */
+    if (!recomp_dispatch_init())
+        fprintf(stderr, "[BOOT] flat dispatch unavailable; "
+                        "indirect calls will use the binary search\n");
+
+    /* Arm the hang watchdog. Does nothing unless RECOMP_WATCHDOG_SECS is set,
+     * and must be called from this thread -- the guest registers it samples are
+     * thread-local, so it has to be handed the copies belonging to the thread
+     * that runs guest code.
+     *
+     * Not optional boilerplate: without this call RECOMP_WATCHDOG_SECS is
+     * silently inert, and the one diagnostic that tells a hang from slowness
+     * does nothing while appearing to be set. */
+    /* Controllers: the keyboard/XInput layer and the emulated USB host
+     * controller XAPI enumerates pads through. Nothing called these, so the
+     * RECOMP_USB setting had no effect. Needs guest memory mapped first. */
+    {
+        extern void xbox_InputInit(void);
+        extern void xbox_OhciInit(void);
+        xbox_InputInit();
+        xbox_OhciInit();
+#ifdef LAMBO_AUDIO_SHIM
+        {
+            extern void Audio_Init(void);
+            Audio_Init();
+        }
+#endif
+    }
+    /* D3D's pushbuffer-space wait (0x0015BA60): with the pushbuffer full, D3D
+     * resets the event at device + 0x1964, writes software method 5 and waits
+     * for the GPU's interrupt handler to set it when the GPU gets there. */
+    {
+        extern void nv2a_pb_exec_set_sw_method_hook(void (*fn)(uint32_t));
+        nv2a_pb_exec_set_sw_method_hook(lambo_sw_method);
+    }
+    xbox_WatchdogStart();
+    if (getenv("LAMBO_GPU_SAMPLER")) CreateThread(NULL, 0, lambo_gpu_sampler, NULL, 0, NULL);
+    if (getenv("LAMBO_PAD_PEEK")) CreateThread(NULL, 0, lambo_pad_peek, NULL, 0, NULL);
+    if (getenv("LAMBO_PROFILE"))
+        CreateThread(NULL, 0, lambo_profiler, NULL, 0, NULL);
+    if (getenv("LAMBO_STACK_SAMPLE")) {
+        int ms = atoi(getenv("LAMBO_STACK_SAMPLE"));
+        s_sample_esp = &g_esp;
+        CreateThread(NULL, 0, lambo_stack_sampler,
+                     (LPVOID)(uintptr_t)(ms > 0 ? ms : 1000), 0, NULL);
+    }
+
+    /* Step 7: Call the recompiled entry point */
+    printf("\nStarting game...\n");
+    fflush(stdout);
+
+    xbe_entry_point();
+
+    printf("\nGame returned. Cleaning up...\n");
+
+    /* Cleanup */
+    xbox_kernel_shutdown();
+    xbox_MemoryLayoutShutdown();
+    free(xbe_data);
+
+    return 0;
+}
+
+/* ── XBE Loading ───────────────────────────────────────────── */
+
+static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "Cannot open XBE: %s\n", path);
+        return FALSE;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (size <= 0) {
+        fclose(f);
+        return FALSE;
+    }
+
+    void *data = malloc((size_t)size);
+    if (!data) {
+        fclose(f);
+        return FALSE;
+    }
+
+    if (fread(data, 1, (size_t)size, f) != (size_t)size) {
+        free(data);
+        fclose(f);
+        return FALSE;
+    }
+
+    fclose(f);
+    *out_data = data;
+    *out_size = (size_t)size;
+    return TRUE;
+}
+
+#if !defined(_WIN32)
+static int lambo_guest_main(void)
+{
+    return WinMain(NULL, NULL, NULL, 0);
+}
+#endif
+
+/* Console entry point (for debugging -- lets you see printf output) */
+int main(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+#if defined(_WIN32)
+    return WinMain(GetModuleHandle(NULL), NULL, GetCommandLineA(), SW_SHOW);
+#else
+    /* SDL's window has to own the process main thread, so the game boots on
+     * a thread of its own (xbox_HostWindowMain, src/video/fb_present_sdl.c)
+     * and this thread runs the window, which shows each flip's finished
+     * frame. The window switch is read before the guest starts, so its
+     * default is set here rather than with the others in WinMain. */
+    {
+        extern int xbox_HostWindowMain(int (*guest_main)(void));
+        if (!getenv("RECOMP_FB_WINDOW")) _putenv("RECOMP_FB_WINDOW=1");
+        /* Pixels on the host GPU (xboxrecomp nv2a_gl.c): ~50 fps races
+         * against ~5 on the software rasteriser. RECOMP_GL=0 turns it off;
+         * without a usable EGL/OpenGL 4.3 it falls back by itself. */
+        if (!getenv("RECOMP_GL")) _putenv("RECOMP_GL=1");
+        return xbox_HostWindowMain(lambo_guest_main);
+    }
+#endif
+}

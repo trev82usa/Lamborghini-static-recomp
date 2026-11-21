@@ -1,0 +1,18 @@
+[
+ {
+  "start": "0x000D41A0",
+  "reason": "MainChampCallback, registered by pointer at 0xD5A3A; ICALL failure in championship"
+ },
+ {
+  "start": "0x000D74E0",
+  "reason": "ChallengeCallback (cash challenge screen), registered by pointer; never reached by static analysis"
+ },
+ {
+  "start": "0x000F2F20",
+  "reason": "OnlineSearchCallback, registered by pointer; never reached by static analysis"
+ },
+ {
+  "start": "0x000F8BC0",
+  "reason": "GameCallback, registered by pointer; never reached by static analysis"
+ }
+]

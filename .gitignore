@@ -1,0 +1,17 @@
+# Never commit game data or code derived from the game binary
+src/recomp/gen/
+game/
+Lamborghini/
+*.xbe
+*.xfs
+*.iso
+*_analysis.json
+build/
+build-clang/
+*.exe
+*.bmp
+*.log
+lamborghini_log*.txt
+build-linux/
+build-audio/
+*.x86_64
