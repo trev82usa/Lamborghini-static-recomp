@@ -50,29 +50,23 @@ running on an emulated Xbox kernel, GPU (NV2A → OpenGL) and audio (MCPX APU �
 
 1. Download `Lamborghini-recomp-<version>-linux-x86_64.zip` from
    [**Releases**](../../releases/latest) and extract it.
-2. Put your game files into the `Lamborghini` folder inside it
+2. Extract your whole game ISO into the `Lamborghini` folder inside it
    ([how](#getting-the-game-files)):
    ```
    Lamborghini-recomp/
        Lamborghini.x86_64        <- run this
-       Lamborghini/              <- your game files go in here
-           default.xbe
-           cars.xfs, gui.xfs, ... (all the .xfs files)
-           Audio/
-           Foreign/
+       Lamborghini/              <- extract your ISO in here
+           default.xbe, *.xfs, Audio/, Foreign/, ...
    ```
 3. Run `Lamborghini.x86_64` (double-click it, or `./Lamborghini.x86_64` in a terminal). If it
    won't start, make it executable first: `chmod +x Lamborghini.x86_64`.
 
 ## Getting the game files
 
-The game needs **everything from the root of the disc**: `default.xbe`, about 60 `.xfs`
-archives (`cars.xfs`, `gui.xfs`, `guimovies.xfs`, the tracks and drivers, …), the three
-`demo*.rpl` files and the `Audio/` and `Foreign/` folders. That's about 1.2 GB in total. Copy all
-of it into the `Lamborghini` folder. The folder must be named exactly `Lamborghini`, sitting
-next to `Lamborghini.x86_64`.
+**Extract your whole Lamborghini ISO into the `Lamborghini` folder.** That's all: the game
+uses the disc's files as they are.
 
-### From a disc image (.iso): XBLA Installer (easiest)
+### XBLA Installer (easiest)
 
 [**XBLA Installer**](https://github.com/trev82usa/XBLA-Installer) is our own extraction tool.
 Despite the name, it opens **original Xbox ISOs** too, with no command line needed.
@@ -80,26 +74,21 @@ Despite the name, it opens **original Xbox ISOs** too, with no command line need
 1. Download it from its [latest release](https://github.com/trev82usa/XBLA-Installer/releases/latest)
    (Linux: `XBLA-Installer-linux-x64.tar.gz`, extract and run `./XBLA-Installer`; Windows:
    `XBLA-Installer.exe`).
-2. Under **Game package**, pick your Lamborghini `.iso`. It shows the game and title ID
-   (`52410001`).
+2. Under **Game package**, pick your Lamborghini `.iso`.
 3. Tick **Just extract**.
 4. Under **Install into**, pick the `Lamborghini` folder from this port's zip.
 5. Press **Install**.
 
-### From a disc image: extract-xiso (command line)
+### extract-xiso (command line)
 
 ```sh
 extract-xiso -d /path/to/Lamborghini-recomp/Lamborghini  Lamborghini.iso
 ```
 
-### Already-extracted files
+Already have the disc's files extracted? Copy them all into the `Lamborghini` folder.
 
-If you copied the files off a disc or console earlier, copy the whole folder's contents (the one
-with `default.xbe` in it) into `Lamborghini/`.
-
-**Check:** `Lamborghini/default.xbe` should exist, next to files like `Lamborghini/cars.xfs`. If
-`default.xbe` ends up one folder deeper (e.g. `Lamborghini/Lamborghini/default.xbe`), move the
-files up a level.
+**Check:** `Lamborghini/default.xbe` must exist. If it ended up one folder deeper (e.g.
+`Lamborghini/Lamborghini/default.xbe`), move everything up a level.
 
 ## Requirements
 
@@ -237,8 +226,8 @@ Please include:
 | Nothing happens when double-clicked | `chmod +x Lamborghini.x86_64`, or run it from a terminal to see the error |
 | `error while loading shared libraries: libSDL2…` / `libepoxy…` | Install SDL2 and libepoxy ([Requirements](#requirements)) |
 | `GLIBC_2.34 not found` | Your distro is too old; Ubuntu 22.04 or newer is needed |
-| A box says **"Game files not found"** | The game files are missing or in the wrong place. `Lamborghini/default.xbe` must exist next to the program ([Getting the game files](#getting-the-game-files)) |
-| Starts but stops at a disc error / missing sounds or videos | Some files are missing: copy *everything* from the disc, including `Audio/` and `Foreign/` |
+| A box says **"Game files not found"** | The ISO isn't extracted into the right place. `Lamborghini/default.xbe` must exist next to the program ([Getting the game files](#getting-the-game-files)) |
+| Starts but stops at a disc error / missing sounds or videos | Some files are missing: extract the *whole* ISO again |
 | Very slow (single-digit fps) | Your GPU or driver lacks OpenGL 4.3 and the game fell back to the CPU renderer; check the log for `[GL]` lines |
 | Controller not working | Check the log for `[INPUT] controller ... connected`; try another USB port or Bluetooth re-pair |
 
